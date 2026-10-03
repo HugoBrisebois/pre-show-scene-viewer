@@ -1,1 +1,0 @@
-OF_ROOT = /home/hugo/c++_projects/of_v0.12.1_linux64_gcc6_release
