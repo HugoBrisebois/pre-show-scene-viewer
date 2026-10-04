@@ -39,7 +39,7 @@ impl eframe::App for ShowViewer {
 
 fn openFile() {
     let files = FileDialog::new()
-        .add_filter("Audio", &["mp3", "wav", "flac", ])
+        .add_filter("Audio", &["mp3", "wav", "flac" ])
         .set_directory("/")
         .pick_file();
 }
