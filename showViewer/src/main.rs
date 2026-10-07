@@ -1,6 +1,7 @@
 pub mod audio;
 
 use eframe::egui;
+use std::path::PathBuf;
 
 fn main() {
     // init the window
@@ -9,7 +10,9 @@ fn main() {
 }
 
 #[derive(Default)]
-struct ShowViewer {}
+struct ShowViewer {
+    selected_file: Option<PathBuf>,
+}
 
 impl ShowViewer {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
@@ -22,11 +25,14 @@ impl eframe::App for ShowViewer {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("Audio Analyzer");
-            let file = String::new();
             if ui.button("OpenFile").clicked() {
-                audio::openFile();
+                self.selected_file = audio::openFile();
             }
-            ui.label(format!("File loaded: {file}"));
+            if let Some(file) = &self.selected_file {
+                ui.label(format!("File selected: {}", file.display()));
+            } else {
+                ui.label("No file selected");
+            }
         });
     }
 }
