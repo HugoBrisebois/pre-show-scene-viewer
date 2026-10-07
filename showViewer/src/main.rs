@@ -1,18 +1,6 @@
 pub mod audio;
 
 use eframe::egui;
-use rfd::FileDialog;
-use std::fs::File;
-use std::sync::Arc;
-
-// use another file for loading and proccessing the audio files
-
-
-// defining global variables
-struct filepath {
-    filename : String,
-    filetype : String,
-}
 
 fn main() {
     // init the window
@@ -34,19 +22,13 @@ impl eframe::App for ShowViewer {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("Audio Analyzer");
+            let file = String::new();
             if ui.button("OpenFile").clicked() {
-                let mut  file = openFile();
+                audio::openFile();
             }
-            ui.label(format!("File loaded: ", ));
+            ui.label(format!("File loaded: {file}"));
         });
     }
-}
-
-fn openFile() {
-    let _files = FileDialog::new()
-        .add_filter("Audio", &["mp3", "wav", "flac" ])
-        .set_directory("/")
-        .pick_file();
 }
 
 
