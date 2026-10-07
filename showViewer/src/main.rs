@@ -1,13 +1,18 @@
-use std::default;
+pub mod audio;
+
 use eframe::egui;
 use rfd::FileDialog;
+use std::fs::File;
+use std::sync::Arc;
 
-// defining the audio file structure
-struct file {
-    FileLocation: String,
-    file: String
+// use another file for loading and proccessing the audio files
+
+
+// defining global variables
+struct filepath {
+    filename : String,
+    filetype : String,
 }
-
 
 fn main() {
     // init the window
@@ -38,8 +43,13 @@ impl eframe::App for ShowViewer {
 }
 
 fn openFile() {
-    let files = FileDialog::new()
+    let _files = FileDialog::new()
         .add_filter("Audio", &["mp3", "wav", "flac" ])
         .set_directory("/")
         .pick_file();
+}
+
+
+fn loadfile() {
+    audio::load();
 }

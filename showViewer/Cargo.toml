@@ -8,5 +8,5 @@ eframe = "0.36.2"
 egui = "0.36.2"
 ffmpeg-next = "9.0.0"
 realfft = "3.5.0"
-rodio = "0.22.2"
+symphonia = { version = "0.6", features = ["mp3", "wav"] }
 rfd = "0.17.2"
