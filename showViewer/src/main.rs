@@ -1,7 +1,7 @@
 pub mod audio;
 
 use eframe::egui;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() {
     // init the window
@@ -26,7 +26,13 @@ impl eframe::App for ShowViewer {
         egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("Audio Analyzer");
             if ui.button("OpenFile").clicked() {
-                self.selected_file = audio::openFile();
+                if let Some(file) = audio::openFile() {
+                    self.selected_file = Some(file.clone());
+
+                    if let Err(error) = start_analysis(&file) {
+                        eprintln!("Could not analyze {}: {error}", file.display());
+                    }
+                }
             }
             if let Some(file) = &self.selected_file {
                 ui.label(format!("File selected: {}", file.display()));
@@ -37,7 +43,6 @@ impl eframe::App for ShowViewer {
     }
 }
 
-
-fn loadfile() {
-    audio::load();
+fn start_analysis(file: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    audio::analyze(file)
 }

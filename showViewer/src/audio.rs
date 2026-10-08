@@ -1,14 +1,6 @@
 use rfd::FileDialog;
 use std::path::PathBuf;
-// import the audio parsing libraries
-
-
-
-pub fn load() {
-    println!("file loading");
-
-
-}
+use std::{fs::File, path::Path};
 
 pub fn openFile() -> Option<PathBuf>{
     let files: Option<PathBuf> = FileDialog::new()
@@ -19,3 +11,9 @@ pub fn openFile() -> Option<PathBuf>{
     files
 }
 
+pub fn analyze(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let file = File::open(path)?;
+
+    // Decode and analyze `file` here (for example, using Symphonia).
+    Ok(())
+}
