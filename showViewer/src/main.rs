@@ -3,15 +3,20 @@ pub mod audio;
 use eframe::egui;
 use std::path::{Path, PathBuf};
 
-fn main() {
+fn main() -> eframe::Result<()> {
     // init the window
     let native_options = eframe::NativeOptions::default();
-    eframe::run_native("ShowViewer", native_options, Box::new(|cc| Ok(Box::new(ShowViewer::new(cc)))));
+    eframe::run_native(
+        "ShowViewer",
+        native_options,
+        Box::new(|cc| Ok(Box::new(ShowViewer::new(cc)))),
+    )
 }
 
 #[derive(Default)]
 struct ShowViewer {
     selected_file: Option<PathBuf>,
+    audio_samples: Vec<f32>,
 }
 
 impl ShowViewer {
@@ -26,11 +31,12 @@ impl eframe::App for ShowViewer {
         egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("Audio Analyzer");
             if ui.button("OpenFile").clicked() {
-                if let Some(file) = audio::openFile() {
+                if let Some(file) = audio::open_file() {
                     self.selected_file = Some(file.clone());
 
-                    if let Err(error) = start_analysis(&file) {
-                        eprintln!("Could not analyze {}: {error}", file.display());
+                    match start_analysis(&file) {
+                        Ok(samples) => self.audio_samples = samples,
+                        Err(error) => eprintln!("Could not analyze {}: {error}", file.display()),
                     }
                 }
             }
@@ -39,10 +45,11 @@ impl eframe::App for ShowViewer {
             } else {
                 ui.label("No file selected");
             }
+            ui.label(format!("Decoded samples: {}", self.audio_samples.len()));
         });
     }
 }
 
-fn start_analysis(file: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn start_analysis(file: &Path) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
     audio::analyze(file)
 }

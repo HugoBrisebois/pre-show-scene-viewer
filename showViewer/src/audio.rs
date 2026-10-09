@@ -1,19 +1,74 @@
 use rfd::FileDialog;
-use std::path::PathBuf;
-use std::{fs::File, path::Path};
+use std::fs::File;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+use symphonia::core::audio::SampleBuffer;
+use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
+use symphonia::core::errors::Error as SymphoniaError;
+use symphonia::core::formats::FormatOptions;
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
 
-pub fn openFile() -> Option<PathBuf>{
-    let files: Option<PathBuf> = FileDialog::new()
+pub fn open_file() -> Option<PathBuf> {
+    FileDialog::new()
         .add_filter("audio", &["mp3", "wav", "flac"])
         .set_directory("/")
-        .pick_file();
-
-    files
+        .pick_file()
 }
 
-pub fn analyze(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+pub fn analyze(path: &Path) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
     let file = File::open(path)?;
+    let mms = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(extension) = path.extension().and_then(|extension| extension.to_str()) {
+        hint.with_extension(extension);
+    }
 
-    // Decode and analyze `file` here (for example, using Symphonia).
-    Ok(())
+    let probed = symphonia::default::get_probe().format(
+        &hint,
+        mms,
+        &FormatOptions::default(),
+        &MetadataOptions::default(),
+    )?;
+
+    let mut format = probed.format;
+    let (track_id, codec_params) = format
+        .tracks()
+        .iter()
+        .find(|track| track.codec_params.codec != CODEC_TYPE_NULL)
+        .map(|track| (track.id, track.codec_params.clone()))
+        .ok_or_else(|| {
+            std::io::Error::new(ErrorKind::InvalidData, "no supported audio track found")
+        })?;
+    let mut decoder =
+        symphonia::default::get_codecs().make(&codec_params, &DecoderOptions::default())?;
+
+    let mut samples = Vec::new();
+    loop {
+        let packet = match format.next_packet() {
+            Ok(packet) => packet,
+            Err(SymphoniaError::IoError(error)) if error.kind() == ErrorKind::UnexpectedEof => {
+                break;
+            }
+            Err(error) => return Err(Box::new(error)),
+        };
+
+        if packet.track_id() != track_id {
+            continue;
+        }
+
+        match decoder.decode(&packet) {
+            Ok(decoded) => {
+                let mut sample_buffer =
+                    SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
+                sample_buffer.copy_interleaved_ref(decoded);
+                samples.extend_from_slice(sample_buffer.samples());
+            }
+            Err(SymphoniaError::DecodeError(_)) => continue,
+            Err(error) => return Err(Box::new(error)),
+        }
+    }
+
+    Ok(samples)
 }
