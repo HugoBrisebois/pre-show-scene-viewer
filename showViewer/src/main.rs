@@ -36,7 +36,7 @@ impl eframe::App for ShowViewer {
 
                     match start_analysis(&file) {
                         Ok(samples) => self.audio_samples = samples,
-                        Err(error) => eprintln!("Could not analyze {}: {error}", file.display()),
+                        Err(error) => eprintln!("Could not aif nalyze {}: {error}", file.display()),
                     }
                 }
             }
@@ -46,10 +46,14 @@ impl eframe::App for ShowViewer {
                 ui.label("No file selected");
             }
             ui.label(format!("Decoded samples: {}", self.audio_samples.len()));
+            if ui.button("Start Analysis").clicked() {
+                process()
+            }
         });
     }
 }
 
 fn start_analysis(file: &Path) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-    audio::analyze(file)
+    audio::analyze(file);
+    audio::process();
 }

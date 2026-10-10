@@ -1,4 +1,5 @@
 use rfd::FileDialog;
+use symphonia::core::sample;
 use std::fs::File;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -9,6 +10,11 @@ use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
+use realfft::RealFftPlanner;
+use num_complex::Complex;
+
+
+
 
 pub fn open_file() -> Option<PathBuf> {
     FileDialog::new()
@@ -71,4 +77,32 @@ pub fn analyze(path: &Path) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
     }
 
     Ok(samples)
+
+}
+
+pub fn process(f32_samples :&[f32], block_size: usize) -> Vec<f32> {
+    
+    let length = f32_samples;
+
+    // make a planner
+    let mut real_planner = RealFftPlanner::<f64>::new();
+
+    // create an FFT
+    let r2c = real_planner.plan_fft_forward()
+
+    let mut indata = r2c.make_input_vec();
+
+    // making a vector to store the spectrum
+    let mut spectrum = r2c.make_output_vec();
+
+    // check the size of the data input and output
+    assert_eq!(indata.len, length);
+    assert_eq!(spectrum.len, length/2+1);
+
+    // forward transform the signal
+    r2c.process(&mut indata, &mut spectrum).unwrap();
+
+    // create a vector for storing the output
+    let mut outdata = r2c.make_output_vec();
+    assert_eq!(outdata.len, length);
 }
