@@ -104,5 +104,5 @@ pub fn process(f32_samples :&[f32], block_size: usize) -> Vec<f32> {
 
     // create a vector for storing the output
     let mut outdata = r2c.make_output_vec();
-    assert_eq!(outdata.len, length);
+    assert_eq!(outdata.len, length);k
 }
