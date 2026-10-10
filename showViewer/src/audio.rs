@@ -1,5 +1,5 @@
+use realfft::RealFftPlanner;
 use rfd::FileDialog;
-use symphonia::core::sample;
 use std::fs::File;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -10,11 +10,6 @@ use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
-use realfft::RealFftPlanner;
-use num_complex::Complex;
-
-
-
 
 pub fn open_file() -> Option<PathBuf> {
     FileDialog::new()
@@ -77,32 +72,38 @@ pub fn analyze(path: &Path) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
     }
 
     Ok(samples)
-
 }
 
-pub fn process(f32_samples :&[f32], block_size: usize) -> Vec<f32> {
-    
-    let length = f32_samples;
+pub fn process(
+    f32_samples: &[f32],
+    block_size: usize,
+) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    if block_size == 0 {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "block size must be greater than zero",
+        )
+        .into());
+    }
 
-    // make a planner
-    let mut real_planner = RealFftPlanner::<f64>::new();
-
-    // create an FFT
-    let r2c = real_planner.plan_fft_forward()
-
-    let mut indata = r2c.make_input_vec();
-
-    // making a vector to store the spectrum
+    let mut real_planner = RealFftPlanner::<f32>::new();
+    let r2c = real_planner.plan_fft_forward(block_size);
+    let mut input = r2c.make_input_vec();
     let mut spectrum = r2c.make_output_vec();
+    let mut magnitudes = Vec::with_capacity(
+        f32_samples
+            .len()
+            .div_ceil(block_size)
+            .saturating_mul(spectrum.len()),
+    );
 
-    // check the size of the data input and output
-    assert_eq!(indata.len, length);
-    assert_eq!(spectrum.len, length/2+1);
+    for block in f32_samples.chunks(block_size) {
+        input.fill(0.0);
+        input[..block.len()].copy_from_slice(block);
+        r2c.process(&mut input, &mut spectrum)
+            .map_err(|error| std::io::Error::new(ErrorKind::InvalidInput, error.to_string()))?;
+        magnitudes.extend(spectrum.iter().map(|bin| bin.norm()));
+    }
 
-    // forward transform the signal
-    r2c.process(&mut indata, &mut spectrum).unwrap();
-
-    // create a vector for storing the output
-    let mut outdata = r2c.make_output_vec();
-    assert_eq!(outdata.len, length);k
+    Ok(magnitudes)
 }
