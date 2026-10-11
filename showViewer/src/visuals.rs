@@ -1,51 +1,789 @@
+use eframe::egui::epaint::PaintCallback;
+use eframe::egui_glow::CallbackFn;
+use eframe::glow::{self, HasContext as _};
 use egui::{Color32, Painter, Pos2, Rect, Shape, Stroke};
 use std::f32::consts::TAU;
+use std::sync::{Arc, Mutex, mpsc::SyncSender};
 
 pub const SPECTRUM_BINS: usize = 513;
 const LOOP_SECONDS: f32 = 16.0;
+
+pub struct ExportCapture {
+    pub width: u32,
+    pub height: u32,
+    pub frame_count: usize,
+    pub next_frame: usize,
+    pub audio_controls: Vec<[f32; 4]>,
+    pub primary_color: Color32,
+    pub secondary_color: Color32,
+    pub frame_sender: SyncSender<crate::video_export::ExportMessage>,
+}
+
+#[derive(Default)]
+pub struct ExportController {
+    pub capture: Option<ExportCapture>,
+    pub error: Option<String>,
+}
+
+pub fn export_audio_controls(spectrum: &[f32], frame_count: usize, fps: u32) -> Vec<[f32; 4]> {
+    let delta_seconds = 1.0 / fps.max(1) as f32;
+    let mut smoother = AudioSmoother::default();
+    let mut controls = Vec::with_capacity(frame_count);
+    for cycle in 0..2 {
+        for frame_index in 0..frame_count {
+            let phase = frame_index as f32 / frame_count.max(1) as f32;
+            let (bass, mids, treble) = spectrum_energies(spectrum, phase);
+            let (bass, mids, treble, onset) = smoother.update(bass, mids, treble, delta_seconds);
+            if cycle == 1 {
+                controls.push([bass, mids, treble, onset]);
+            }
+        }
+    }
+    controls
+}
+
+pub struct VjShaderPipeline {
+    gl: Arc<glow::Context>,
+    program: glow::Program,
+    vertex_array: glow::VertexArray,
+    buffer: glow::Buffer,
+    time_uniform: Option<glow::UniformLocation>,
+    bass_uniform: Option<glow::UniformLocation>,
+    mids_uniform: Option<glow::UniformLocation>,
+    treble_uniform: Option<glow::UniformLocation>,
+    onset_uniform: Option<glow::UniformLocation>,
+    aspect_uniform: Option<glow::UniformLocation>,
+    primary_color_uniform: Option<glow::UniformLocation>,
+    secondary_color_uniform: Option<glow::UniformLocation>,
+    uniform_warning: Option<String>,
+    export_target: Arc<Mutex<Option<OffscreenTarget>>>,
+}
+
+struct OffscreenTarget {
+    framebuffer: glow::Framebuffer,
+    texture: glow::Texture,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Default)]
+pub struct AudioSmoother {
+    bass: f32,
+    mids: f32,
+    treble: f32,
+    previous_bass: f32,
+    onset: f32,
+}
+
+impl AudioSmoother {
+    fn update(
+        &mut self,
+        bass: f32,
+        mids: f32,
+        treble: f32,
+        delta_seconds: f32,
+    ) -> (f32, f32, f32, f32) {
+        let delta_seconds = delta_seconds.clamp(0.0, 0.1);
+        let onset_strength = ((bass - self.previous_bass * 1.12 - 0.018) / 0.16).clamp(0.0, 1.0);
+        self.onset = self.onset.max(onset_strength) * (-delta_seconds / 0.24).exp();
+        self.previous_bass = bass;
+        self.bass = smooth_audio_level(self.bass, bass, delta_seconds);
+        self.mids = smooth_audio_level(self.mids, mids, delta_seconds);
+        self.treble = smooth_audio_level(self.treble, treble, delta_seconds);
+        (self.bass, self.mids, self.treble, self.onset)
+    }
+}
+
+fn smooth_audio_level(current: f32, target: f32, delta_seconds: f32) -> f32 {
+    let time_constant = if target > current { 0.045 } else { 0.28 };
+    let blend = 1.0 - (-delta_seconds / time_constant).exp();
+    current + (target - current) * blend
+}
+
+impl VjShaderPipeline {
+    pub fn new(gl: Arc<glow::Context>) -> Result<Self, String> {
+        let vertex_shader = compile_shader(
+            &gl,
+            glow::VERTEX_SHADER,
+            include_str!("shaders/vertex.glsl"),
+        )?;
+        let fragment_shader = match compile_shader(
+            &gl,
+            glow::FRAGMENT_SHADER,
+            include_str!("shaders/fragments.glsl"),
+        ) {
+            Ok(shader) => shader,
+            Err(error) => {
+                unsafe { gl.delete_shader(vertex_shader) };
+                return Err(error);
+            }
+        };
+
+        let program = unsafe { gl.create_program() }.map_err(|error| {
+            unsafe {
+                gl.delete_shader(vertex_shader);
+                gl.delete_shader(fragment_shader);
+            }
+            error
+        })?;
+
+        unsafe {
+            gl.attach_shader(program, vertex_shader);
+            gl.attach_shader(program, fragment_shader);
+            gl.link_program(program);
+            gl.delete_shader(vertex_shader);
+            gl.delete_shader(fragment_shader);
+        }
+        if !unsafe { gl.get_program_link_status(program) } {
+            let error = unsafe { gl.get_program_info_log(program) };
+            unsafe { gl.delete_program(program) };
+            return Err(format!("Could not link reactive shader program: {error}"));
+        }
+
+        let uniforms = unsafe {
+            (
+                gl.get_uniform_location(program, "u_time"),
+                gl.get_uniform_location(program, "u_bass"),
+                gl.get_uniform_location(program, "u_mids"),
+                gl.get_uniform_location(program, "u_treble"),
+                gl.get_uniform_location(program, "u_onset"),
+                gl.get_uniform_location(program, "u_aspect"),
+                gl.get_uniform_location(program, "u_primary_color"),
+                gl.get_uniform_location(program, "u_secondary_color"),
+            )
+        };
+        let (
+            time_uniform,
+            bass_uniform,
+            mids_uniform,
+            treble_uniform,
+            onset_uniform,
+            aspect_uniform,
+            primary_color_uniform,
+            secondary_color_uniform,
+        ) = uniforms;
+        let missing_uniforms = [
+            ("u_time", time_uniform.is_none()),
+            ("u_bass", bass_uniform.is_none()),
+            ("u_mids", mids_uniform.is_none()),
+            ("u_treble", treble_uniform.is_none()),
+            ("u_onset", onset_uniform.is_none()),
+            ("u_aspect", aspect_uniform.is_none()),
+            ("u_primary_color", primary_color_uniform.is_none()),
+            ("u_secondary_color", secondary_color_uniform.is_none()),
+        ]
+        .into_iter()
+        .filter_map(|(name, missing)| missing.then_some(name))
+        .collect::<Vec<_>>();
+        let uniform_warning = (!missing_uniforms.is_empty()).then(|| {
+            format!(
+                "OpenGL optimized out or could not locate shader uniform(s): {}",
+                missing_uniforms.join(", ")
+            )
+        });
+
+        let (vertex_array, buffer) = unsafe { (gl.create_vertex_array(), gl.create_buffer()) };
+        let (vertex_array, buffer) = match (vertex_array, buffer) {
+            (Ok(vertex_array), Ok(buffer)) => (vertex_array, buffer),
+            (vertex_array, buffer) => {
+                let error = match (&vertex_array, &buffer) {
+                    (Err(error), _) | (_, Err(error)) => error.clone(),
+                    _ => "unknown OpenGL allocation error".to_owned(),
+                };
+                let vertex_array = vertex_array.ok();
+                let buffer = buffer.ok();
+                unsafe {
+                    gl.delete_program(program);
+                    if let Some(vertex_array) = vertex_array {
+                        gl.delete_vertex_array(vertex_array);
+                    }
+                    if let Some(buffer) = buffer {
+                        gl.delete_buffer(buffer);
+                    }
+                }
+                return Err(format!(
+                    "Could not allocate reactive shader geometry: {error}"
+                ));
+            }
+        };
+
+        let vertices: [f32; 12] = [
+            -1.0, -1.0, 1.0, -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, 1.0,
+        ];
+        unsafe {
+            gl.bind_vertex_array(Some(vertex_array));
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(buffer));
+            gl.buffer_data_u8_slice(
+                glow::ARRAY_BUFFER,
+                std::slice::from_raw_parts(
+                    vertices.as_ptr().cast::<u8>(),
+                    std::mem::size_of_val(&vertices),
+                ),
+                glow::STATIC_DRAW,
+            );
+            gl.enable_vertex_attrib_array(0);
+            gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 2 * 4, 0);
+            gl.bind_buffer(glow::ARRAY_BUFFER, None);
+            gl.bind_vertex_array(None);
+        }
+
+        Ok(Self {
+            gl,
+            program,
+            vertex_array,
+            buffer,
+            time_uniform,
+            bass_uniform,
+            mids_uniform,
+            treble_uniform,
+            onset_uniform,
+            aspect_uniform,
+            primary_color_uniform,
+            secondary_color_uniform,
+            uniform_warning,
+            export_target: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    pub fn uniform_warning(&self) -> Option<&str> {
+        self.uniform_warning.as_deref()
+    }
+
+    fn paint_callback(
+        &self,
+        rect: Rect,
+        time: f32,
+        bass: f32,
+        mids: f32,
+        treble: f32,
+        onset: f32,
+        primary_color: Color32,
+        secondary_color: Color32,
+        export_controller: Arc<Mutex<ExportController>>,
+    ) -> PaintCallback {
+        let gl = Arc::clone(&self.gl);
+        let program = self.program;
+        let vertex_array = self.vertex_array;
+        let time_uniform = self.time_uniform;
+        let bass_uniform = self.bass_uniform;
+        let mids_uniform = self.mids_uniform;
+        let treble_uniform = self.treble_uniform;
+        let onset_uniform = self.onset_uniform;
+        let aspect_uniform = self.aspect_uniform;
+        let primary_color_uniform = self.primary_color_uniform;
+        let secondary_color_uniform = self.secondary_color_uniform;
+        let aspect = rect.width() / rect.height().max(1.0);
+        let primary_color = color_to_rgb(primary_color);
+        let secondary_color = color_to_rgb(secondary_color);
+        let export_target = Arc::clone(&self.export_target);
+
+        PaintCallback {
+            rect,
+            callback: Arc::new(CallbackFn::new(move |_info, _painter| {
+                draw_shader(
+                    &gl,
+                    program,
+                    vertex_array,
+                    &time_uniform,
+                    &bass_uniform,
+                    &mids_uniform,
+                    &treble_uniform,
+                    &onset_uniform,
+                    &aspect_uniform,
+                    &primary_color_uniform,
+                    &secondary_color_uniform,
+                    time,
+                    bass,
+                    mids,
+                    treble,
+                    onset,
+                    aspect,
+                    primary_color,
+                    secondary_color,
+                );
+                render_export_frame(
+                    &gl,
+                    program,
+                    vertex_array,
+                    &time_uniform,
+                    &bass_uniform,
+                    &mids_uniform,
+                    &treble_uniform,
+                    &onset_uniform,
+                    &aspect_uniform,
+                    &primary_color_uniform,
+                    &secondary_color_uniform,
+                    &export_target,
+                    &export_controller,
+                );
+            })),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_shader(
+    gl: &glow::Context,
+    program: glow::Program,
+    vertex_array: glow::VertexArray,
+    time_uniform: &Option<glow::UniformLocation>,
+    bass_uniform: &Option<glow::UniformLocation>,
+    mids_uniform: &Option<glow::UniformLocation>,
+    treble_uniform: &Option<glow::UniformLocation>,
+    onset_uniform: &Option<glow::UniformLocation>,
+    aspect_uniform: &Option<glow::UniformLocation>,
+    primary_color_uniform: &Option<glow::UniformLocation>,
+    secondary_color_uniform: &Option<glow::UniformLocation>,
+    time: f32,
+    bass: f32,
+    mids: f32,
+    treble: f32,
+    onset: f32,
+    aspect: f32,
+    primary_color: [f32; 3],
+    secondary_color: [f32; 3],
+) {
+    unsafe {
+        gl.use_program(Some(program));
+        gl.uniform_1_f32(time_uniform.as_ref(), time);
+        if let Some(uniform) = bass_uniform {
+            gl.uniform_1_f32(Some(uniform), bass);
+        }
+        if let Some(uniform) = mids_uniform {
+            gl.uniform_1_f32(Some(uniform), mids);
+        }
+        if let Some(uniform) = treble_uniform {
+            gl.uniform_1_f32(Some(uniform), treble);
+        }
+        if let Some(uniform) = onset_uniform {
+            gl.uniform_1_f32(Some(uniform), onset);
+        }
+        if let Some(uniform) = aspect_uniform {
+            gl.uniform_1_f32(Some(uniform), aspect);
+        }
+        if let Some(uniform) = primary_color_uniform {
+            gl.uniform_3_f32(
+                Some(uniform),
+                primary_color[0],
+                primary_color[1],
+                primary_color[2],
+            );
+        }
+        if let Some(uniform) = secondary_color_uniform {
+            gl.uniform_3_f32(
+                Some(uniform),
+                secondary_color[0],
+                secondary_color[1],
+                secondary_color[2],
+            );
+        }
+        gl.bind_vertex_array(Some(vertex_array));
+        gl.draw_arrays(glow::TRIANGLES, 0, 6);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_export_frame(
+    gl: &glow::Context,
+    program: glow::Program,
+    vertex_array: glow::VertexArray,
+    time_uniform: &Option<glow::UniformLocation>,
+    bass_uniform: &Option<glow::UniformLocation>,
+    mids_uniform: &Option<glow::UniformLocation>,
+    treble_uniform: &Option<glow::UniformLocation>,
+    onset_uniform: &Option<glow::UniformLocation>,
+    aspect_uniform: &Option<glow::UniformLocation>,
+    primary_color_uniform: &Option<glow::UniformLocation>,
+    secondary_color_uniform: &Option<glow::UniformLocation>,
+    export_target: &Arc<Mutex<Option<OffscreenTarget>>>,
+    export_controller: &Arc<Mutex<ExportController>>,
+) {
+    let Ok(mut controller) = export_controller.lock() else {
+        return;
+    };
+    let Some(mut capture) = controller.capture.take() else {
+        return;
+    };
+
+    if capture.next_frame >= capture.frame_count {
+        let _ = capture
+            .frame_sender
+            .send(crate::video_export::ExportMessage::Finish);
+        return;
+    }
+
+    let previous_framebuffer = unsafe { gl.get_parameter_framebuffer(glow::FRAMEBUFFER_BINDING) };
+    let mut previous_viewport = [0; 4];
+    let previous_pack_alignment = unsafe { gl.get_parameter_i32(glow::PACK_ALIGNMENT) };
+    let scissor_was_enabled = unsafe { gl.is_enabled(glow::SCISSOR_TEST) };
+    unsafe { gl.get_parameter_i32_slice(glow::VIEWPORT, &mut previous_viewport) };
+
+    let target = match ensure_export_target(gl, export_target, capture.width, capture.height) {
+        Ok(target) => target,
+        Err(error) => {
+            let _ = capture
+                .frame_sender
+                .send(crate::video_export::ExportMessage::Finish);
+            controller.error = Some(error);
+            unsafe {
+                gl.bind_framebuffer(glow::FRAMEBUFFER, previous_framebuffer);
+                gl.viewport(
+                    previous_viewport[0],
+                    previous_viewport[1],
+                    previous_viewport[2],
+                    previous_viewport[3],
+                );
+                if scissor_was_enabled {
+                    gl.enable(glow::SCISSOR_TEST);
+                }
+            }
+            return;
+        }
+    };
+
+    let Some([bass, mids, treble, onset]) = capture.audio_controls.get(capture.next_frame).copied()
+    else {
+        let _ = capture
+            .frame_sender
+            .send(crate::video_export::ExportMessage::Finish);
+        controller.error = Some("Export audio analysis has too few frame values".to_owned());
+        return;
+    };
+    let time = capture.next_frame as f32 / capture.frame_count as f32 * TAU;
+    let aspect = capture.width as f32 / capture.height as f32;
+    let primary_color = color_to_rgb(capture.primary_color);
+    let secondary_color = color_to_rgb(capture.secondary_color);
+    let width = capture.width as i32;
+    let height = capture.height as i32;
+
+    unsafe {
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(target.framebuffer));
+        gl.viewport(0, 0, width, height);
+        gl.disable(glow::SCISSOR_TEST);
+        gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
+        draw_shader(
+            gl,
+            program,
+            vertex_array,
+            time_uniform,
+            bass_uniform,
+            mids_uniform,
+            treble_uniform,
+            onset_uniform,
+            aspect_uniform,
+            primary_color_uniform,
+            secondary_color_uniform,
+            time,
+            bass,
+            mids,
+            treble,
+            onset,
+            aspect,
+            primary_color,
+            secondary_color,
+        );
+
+        let mut pixels = vec![0; capture.width as usize * capture.height as usize * 4];
+        gl.read_pixels(
+            0,
+            0,
+            width,
+            height,
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
+            glow::PixelPackData::Slice(Some(&mut pixels)),
+        );
+
+        let row_bytes = capture.width as usize * 4;
+        let mut top_down_pixels = vec![0; pixels.len()];
+        for row in 0..capture.height as usize {
+            let source_row = capture.height as usize - row - 1;
+            let source_start = source_row * row_bytes;
+            let destination_start = row * row_bytes;
+            top_down_pixels[destination_start..destination_start + row_bytes]
+                .copy_from_slice(&pixels[source_start..source_start + row_bytes]);
+        }
+
+        gl.bind_framebuffer(glow::FRAMEBUFFER, previous_framebuffer);
+        gl.viewport(
+            previous_viewport[0],
+            previous_viewport[1],
+            previous_viewport[2],
+            previous_viewport[3],
+        );
+        gl.pixel_store_i32(glow::PACK_ALIGNMENT, previous_pack_alignment);
+        if scissor_was_enabled {
+            gl.enable(glow::SCISSOR_TEST);
+        }
+
+        match capture
+            .frame_sender
+            .send(crate::video_export::ExportMessage::Frame(top_down_pixels))
+        {
+            Ok(()) => capture.next_frame += 1,
+            Err(error) => {
+                controller.error =
+                    Some(format!("Could not send rendered frame to encoder: {error}"));
+                return;
+            }
+        }
+
+        if capture.next_frame >= capture.frame_count {
+            let _ = capture
+                .frame_sender
+                .send(crate::video_export::ExportMessage::Finish);
+        } else {
+            controller.capture = Some(capture);
+        }
+    }
+}
+
+fn ensure_export_target(
+    gl: &glow::Context,
+    export_target: &Arc<Mutex<Option<OffscreenTarget>>>,
+    width: u32,
+    height: u32,
+) -> Result<OffscreenTarget, String> {
+    let mut current = export_target
+        .lock()
+        .map_err(|_| "Export render target lock was poisoned".to_owned())?;
+    if let Some(target) = current.as_ref()
+        && target.width == width
+        && target.height == height
+    {
+        return Ok(OffscreenTarget {
+            framebuffer: target.framebuffer,
+            texture: target.texture,
+            width,
+            height,
+        });
+    }
+
+    if let Some(target) = current.take() {
+        unsafe {
+            gl.delete_framebuffer(target.framebuffer);
+            gl.delete_texture(target.texture);
+        }
+    }
+
+    let texture = unsafe { gl.create_texture() }
+        .map_err(|error| format!("Could not create export texture: {error}"))?;
+    unsafe {
+        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_MIN_FILTER,
+            glow::LINEAR as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_MAG_FILTER,
+            glow::LINEAR as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_WRAP_S,
+            glow::CLAMP_TO_EDGE as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_WRAP_T,
+            glow::CLAMP_TO_EDGE as i32,
+        );
+        gl.tex_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            glow::RGBA8 as i32,
+            width as i32,
+            height as i32,
+            0,
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
+            glow::PixelUnpackData::Slice(None),
+        );
+    }
+
+    let framebuffer = match unsafe { gl.create_framebuffer() } {
+        Ok(framebuffer) => framebuffer,
+        Err(error) => {
+            unsafe { gl.delete_texture(texture) };
+            return Err(format!("Could not create export framebuffer: {error}"));
+        }
+    };
+    unsafe {
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
+        gl.framebuffer_texture_2d(
+            glow::FRAMEBUFFER,
+            glow::COLOR_ATTACHMENT0,
+            glow::TEXTURE_2D,
+            Some(texture),
+            0,
+        );
+        let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+        if status != glow::FRAMEBUFFER_COMPLETE {
+            gl.delete_framebuffer(framebuffer);
+            gl.delete_texture(texture);
+            return Err(format!(
+                "Export framebuffer is incomplete (OpenGL status 0x{status:04x})"
+            ));
+        }
+    }
+
+    let target = OffscreenTarget {
+        framebuffer,
+        texture,
+        width,
+        height,
+    };
+    *current = Some(OffscreenTarget {
+        framebuffer,
+        texture,
+        width,
+        height,
+    });
+    Ok(target)
+}
+
+fn color_to_rgb(color: Color32) -> [f32; 3] {
+    [
+        color.r() as f32 / 255.0,
+        color.g() as f32 / 255.0,
+        color.b() as f32 / 255.0,
+    ]
+}
+
+impl Drop for VjShaderPipeline {
+    fn drop(&mut self) {
+        unsafe {
+            self.gl.delete_program(self.program);
+            self.gl.delete_vertex_array(self.vertex_array);
+            self.gl.delete_buffer(self.buffer);
+            if let Ok(target) = self.export_target.lock()
+                && let Some(target) = target.as_ref()
+            {
+                self.gl.delete_framebuffer(target.framebuffer);
+                self.gl.delete_texture(target.texture);
+            }
+        }
+    }
+}
+
+fn compile_shader(
+    gl: &glow::Context,
+    shader_type: u32,
+    source: &str,
+) -> Result<glow::Shader, String> {
+    let shader = unsafe { gl.create_shader(shader_type) }
+        .map_err(|error| format!("Could not create reactive shader: {error}"))?;
+    unsafe {
+        gl.shader_source(shader, source);
+        gl.compile_shader(shader);
+    }
+    if !unsafe { gl.get_shader_compile_status(shader) } {
+        let error = unsafe { gl.get_shader_info_log(shader) };
+        unsafe { gl.delete_shader(shader) };
+        return Err(format!("Could not compile reactive shader: {error}"));
+    }
+    Ok(shader)
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Scene {
     Aurora,
     Orbit,
     Kaleidoscope,
+    Reactive,
 }
 
 impl Scene {
-    pub const ALL: [Self; 3] = [Self::Aurora, Self::Orbit, Self::Kaleidoscope];
+    pub const ALL: [Self; 4] = [
+        Self::Aurora,
+        Self::Orbit,
+        Self::Kaleidoscope,
+        Self::Reactive,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Aurora => "Aurora",
             Self::Orbit => "Orbit",
             Self::Kaleidoscope => "Kaleidoscope",
+            Self::Reactive => "Reactive",
         }
     }
 }
 
-pub fn render(painter: &Painter, rect: Rect, spectrum: &[f32], elapsed_seconds: f32, scene: Scene) {
+pub fn render(
+    painter: &Painter,
+    rect: Rect,
+    spectrum: &[f32],
+    elapsed_seconds: f32,
+    scene: Scene,
+    shader_pipeline: Option<&VjShaderPipeline>,
+    audio_smoother: &mut AudioSmoother,
+    delta_seconds: f32,
+    primary_color: Color32,
+    secondary_color: Color32,
+    export_controller: Arc<Mutex<ExportController>>,
+) {
     let phase = elapsed_seconds.rem_euclid(LOOP_SECONDS) / LOOP_SECONDS;
-    let mut frame = spectrum_frame(spectrum, phase);
-    let peak = frame.iter().copied().fold(0.0_f32, f32::max);
-    if peak > 0.0 {
-        for value in &mut frame {
-            *value = (*value / peak).sqrt().clamp(0.0, 1.0);
-        }
-    }
-
-    let bass = band_energy(&frame, 1..32);
-    let mids = band_energy(&frame, 32..160);
-    let highs = band_energy(&frame, 160..SPECTRUM_BINS);
+    let (bass, mids, highs) = spectrum_energies(spectrum, phase);
     let energy = (bass * 0.45 + mids * 0.35 + highs * 0.2).clamp(0.0, 1.0);
 
-    painter.rect_filled(rect, 4.0, Color32::from_rgb(7, 10, 24));
-    let glow = Color32::from_rgba_unmultiplied(80, 220, 255, (energy * 110.0) as u8);
-    painter.circle_filled(rect.center(), rect.width().min(rect.height()) * 0.34, glow);
-
     match scene {
-        Scene::Aurora => draw_aurora(painter, rect, &frame, phase, bass, mids, highs),
-        Scene::Orbit => draw_orbit(painter, rect, &frame, phase, bass, mids, highs),
-        Scene::Kaleidoscope => draw_kaleidoscope(painter, rect, &frame, phase, bass, mids, highs),
+        Scene::Reactive => {
+            if let Some(pipeline) = shader_pipeline {
+                let (smoothed_bass, smoothed_mids, smoothed_treble, onset) =
+                    audio_smoother.update(bass, mids, highs, delta_seconds);
+                painter.add(pipeline.paint_callback(
+                    rect,
+                    phase * TAU,
+                    smoothed_bass,
+                    smoothed_mids,
+                    smoothed_treble,
+                    onset,
+                    primary_color,
+                    secondary_color,
+                    Arc::clone(&export_controller),
+                ));
+            } else {
+                painter.rect_filled(rect, 4.0, Color32::from_rgb(7, 10, 24));
+            }
+        }
+        scene => {
+            let mut frame = spectrum_frame(spectrum, phase);
+            normalize_spectrum(&mut frame);
+            painter.rect_filled(rect, 4.0, Color32::from_rgb(7, 10, 24));
+            let glow = Color32::from_rgba_unmultiplied(80, 220, 255, (energy * 110.0) as u8);
+            painter.circle_filled(rect.center(), rect.width().min(rect.height()) * 0.34, glow);
+            match scene {
+                Scene::Aurora => draw_aurora(painter, rect, &frame, phase, bass, mids, highs),
+                Scene::Orbit => draw_orbit(painter, rect, &frame, phase, bass, mids, highs),
+                Scene::Kaleidoscope => {
+                    draw_kaleidoscope(painter, rect, &frame, phase, bass, mids, highs)
+                }
+                Scene::Reactive => unreachable!(),
+            }
+        }
+    }
+}
+
+fn spectrum_energies(spectrum: &[f32], phase: f32) -> (f32, f32, f32) {
+    let mut frame = spectrum_frame(spectrum, phase);
+    normalize_spectrum(&mut frame);
+    (
+        band_energy(&frame, 1..32),
+        band_energy(&frame, 32..160),
+        band_energy(&frame, 160..SPECTRUM_BINS),
+    )
+}
+
+fn normalize_spectrum(frame: &mut [f32]) {
+    let peak = frame.iter().copied().fold(0.0_f32, f32::max);
+    if peak > 0.0 {
+        for value in frame {
+            *value = (*value / peak).sqrt().clamp(0.0, 1.0);
+        }
     }
 }
 
@@ -238,7 +976,7 @@ fn draw_kaleidoscope(
 
 #[cfg(test)]
 mod tests {
-    use super::{SPECTRUM_BINS, spectrum_frame};
+    use super::{AudioSmoother, SPECTRUM_BINS, spectrum_frame};
 
     #[test]
     fn spectrum_frame_interpolates_and_wraps_between_frames() {
@@ -260,5 +998,24 @@ mod tests {
     #[test]
     fn spectrum_frame_is_silent_without_analyzed_audio() {
         assert!(spectrum_frame(&[], 0.5).iter().all(|value| *value == 0.0));
+    }
+
+    #[test]
+    fn audio_smoothing_attacks_faster_than_it_releases() {
+        let mut smoother = AudioSmoother::default();
+        let (attack, _, _, onset) = smoother.update(1.0, 0.0, 1.0, 0.1);
+        let (release, _, _, _) = smoother.update(0.0, 0.0, 0.0, 0.1);
+
+        assert!(attack > 0.8);
+        assert!(onset > 0.0);
+        assert!(release > 0.0);
+        assert!(release < attack);
+    }
+
+    #[test]
+    fn export_audio_controls_cover_each_requested_frame() {
+        let controls = super::export_audio_controls(&[], 480, 30);
+        assert_eq!(controls.len(), 480);
+        assert!(controls.iter().all(|frame| frame.iter().all(|v| *v == 0.0)));
     }
 }
