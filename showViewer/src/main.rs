@@ -1,7 +1,6 @@
 pub mod audio;
 pub mod video_export;
 pub mod visuals;
-
 use eframe::egui;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -135,6 +134,13 @@ enum WorkerKind {
 
 impl ShowViewer {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let mut app_visuals = egui::Visuals::dark();
+        app_visuals.panel_fill = egui::Color32::from_rgb(13, 16, 22);
+        app_visuals.window_fill = egui::Color32::from_rgb(24, 29, 38);
+        app_visuals.extreme_bg_color = egui::Color32::from_rgb(10, 13, 19);
+        app_visuals.selection.bg_fill = egui::Color32::from_rgb(46, 132, 117);
+        cc.egui_ctx.set_visuals(app_visuals);
+
         let (worker_tx, worker_rx) = mpsc::channel();
         let (shader_pipeline, shader_error, shader_warning) = match cc.gl.as_ref() {
             Some(gl) => match visuals::VjShaderPipeline::new(Arc::clone(gl)) {
@@ -268,244 +274,414 @@ impl eframe::App for ShowViewer {
 
         ui.ctx().request_repaint_after(Duration::from_millis(16));
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading("Reactive VJ Loops");
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(
-                        self.busy.is_none() && !self.exporting,
-                        egui::Button::new("Open audio"),
-                    )
-                    .clicked()
-                {
-                    if let Some(file) = audio::open_file() {
-                        self.selected_file = Some(file.clone());
-                        self.audio_samples = Arc::from([]);
-                        self.spectrum.clear();
-                        self.error = None;
-                        self.busy = Some(WorkerKind::Decoding);
-                        let sender = self.worker_tx.clone();
-                        let display_path = file.display().to_string();
-                        std::thread::spawn(move || {
-                            let result = start_analysis(&file).map_err(|error| {
-                                format!("Could not analyze {display_path}: {error}")
-                            });
-                            let _ = sender.send(WorkerMessage::Decoded(result));
-                        });
-                    }
-                }
-                if ui
-                    .add_enabled(
-                        self.busy.is_none() && !self.exporting && !self.audio_samples.is_empty(),
-                        egui::Button::new("Analyze audio"),
-                    )
-                    .clicked()
-                {
-                    self.busy = Some(WorkerKind::Processing);
-                    self.error = None;
-                    let sender = self.worker_tx.clone();
-                    let samples = Arc::clone(&self.audio_samples);
-                    std::thread::spawn(move || {
-                        let result = audio::process(&samples, FFT_BLOCK_SIZE)
-                            .map_err(|error| error.to_string());
-                        let _ = sender.send(WorkerMessage::Processed(result));
-                    });
-                }
-
-                ui.add_enabled_ui(!self.exporting, |ui| {
-                    egui::ComboBox::from_id_salt("visual_scene")
-                        .selected_text(self.scene.label())
-                        .show_ui(ui, |ui| {
-                            for scene in visuals::Scene::ALL {
-                                if ui
-                                    .selectable_value(&mut self.scene, scene, scene.label())
-                                    .clicked()
-                                    && scene != visuals::Scene::Reactive
-                                {
-                                    self.reactive_rendering = false;
-                                }
-                            }
-                        });
-                });
-            });
-
-            ui.horizontal(|ui| {
-                let toggle_button = egui::Button::new(if self.reactive_rendering {
-                    "Stop Reactive Rendering"
-                } else {
-                    "Start Reactive Rendering"
-                });
-                if ui
-                    .add_enabled(
-                        !self.exporting
-                            && (self.reactive_rendering || self.shader_pipeline.is_some()),
-                        toggle_button,
-                    )
-                    .clicked()
-                {
-                    self.reactive_rendering = !self.reactive_rendering;
-                    if self.reactive_rendering {
-                        self.scene = visuals::Scene::Reactive;
-                        self.preview_started = Instant::now();
-                    }
-                }
-                if self.reactive_rendering {
-                    ui.label("Reactive rendering is running");
-                } else if self.shader_pipeline.is_some() {
-                    ui.label("Reactive rendering is stopped");
-                } else {
-                    ui.colored_label(egui::Color32::RED, "Reactive shader is unavailable");
-                }
-            });
-            if let Some(error) = &self.shader_error {
-                ui.colored_label(egui::Color32::RED, error);
-            }
-            if self.reactive_rendering
-                && let Some(warning) = &self.shader_warning
-            {
-                ui.colored_label(egui::Color32::YELLOW, warning);
-            }
-
-            if self.scene == visuals::Scene::Reactive {
-                ui.add_enabled_ui(!self.exporting, |ui| {
-                    ui.horizontal(|ui| {
-                    egui::ComboBox::from_id_salt("reactive_palette")
-                        .selected_text(self.palette.label())
-                        .show_ui(ui, |ui| {
-                            for palette in Palette::PRESETS {
-                                if ui
-                                    .selectable_value(&mut self.palette, palette, palette.label())
-                                    .clicked()
-                                    && let Some((primary, secondary)) = palette.colors()
-                                {
-                                    self.primary_color = primary;
-                                    self.secondary_color = secondary;
-                                }
-                            }
-                            ui.selectable_value(
-                                &mut self.palette,
-                                Palette::Custom,
-                                Palette::Custom.label(),
-                            );
-                        });
-                    ui.label("Primary");
-                    if ui
-                        .color_edit_button_srgba(&mut self.primary_color)
-                        .changed()
-                    {
-                        self.palette = Palette::Custom;
-                    }
-                    ui.label("Secondary");
-                    if ui
-                        .color_edit_button_srgba(&mut self.secondary_color)
-                        .changed()
-                    {
-                        self.palette = Palette::Custom;
-                    }
-                    });
-                });
-            }
-
-            ui.horizontal(|ui| {
-                ui.add_enabled_ui(!self.exporting, |ui| {
-                    egui::ComboBox::from_id_salt("export_resolution")
-                        .selected_text(self.export_resolution.label())
-                        .show_ui(ui, |ui| {
-                            for resolution in ExportResolution::ALL {
-                                ui.selectable_value(
-                                    &mut self.export_resolution,
-                                    resolution,
-                                    resolution.label(),
+        let available_size = ui.available_size();
+        ui.horizontal(|ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(292.0, available_size.y),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_rgb(19, 23, 31))
+                        .inner_margin(egui::Margin::same(18))
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                ui.heading("SHOWVIEWER");
+                                ui.label(
+                                    egui::RichText::new("AUDIO-REACTIVE VISUALS")
+                                        .small()
+                                        .color(egui::Color32::from_rgb(139, 153, 173)),
                                 );
-                            }
+                                ui.add_space(18.0);
+
+                                ui.label(
+                                    egui::RichText::new("AUDIO SOURCE")
+                                        .small()
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(139, 153, 173)),
+                                );
+                                ui.add_space(6.0);
+                                if ui
+                                    .add_enabled(
+                                        self.busy.is_none() && !self.exporting,
+                                        egui::Button::new("Open audio file")
+                                            .min_size(egui::vec2(256.0, 34.0)),
+                                    )
+                                    .clicked()
+                                    && let Some(file) = audio::open_file()
+                                {
+                                    self.selected_file = Some(file.clone());
+                                    self.audio_samples = Arc::from([]);
+                                    self.spectrum.clear();
+                                    self.error = None;
+                                    self.busy = Some(WorkerKind::Decoding);
+                                    let sender = self.worker_tx.clone();
+                                    let display_path = file.display().to_string();
+                                    std::thread::spawn(move || {
+                                        let result = start_analysis(&file).map_err(|error| {
+                                            format!("Could not analyze {display_path}: {error}")
+                                        });
+                                        let _ = sender.send(WorkerMessage::Decoded(result));
+                                    });
+                                }
+                                if let Some(file) = &self.selected_file {
+                                    ui.add_space(5.0);
+                                    ui.label(
+                                        egui::RichText::new(
+                                            file.file_name().unwrap_or_default().to_string_lossy(),
+                                        )
+                                        .small()
+                                        .color(egui::Color32::from_rgb(200, 208, 220)),
+                                    );
+                                }
+                                ui.add_space(6.0);
+                                ui.horizontal(|ui| {
+                                    let analyze_label = match self.busy {
+                                        Some(WorkerKind::Decoding) => "Decoding audio...",
+                                        Some(WorkerKind::Processing) => "Analyzing...",
+                                        None => "Analyze audio",
+                                    };
+                                    if ui
+                                        .add_enabled(
+                                            self.busy.is_none()
+                                                && !self.exporting
+                                                && !self.audio_samples.is_empty(),
+                                            egui::Button::new(analyze_label),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.busy = Some(WorkerKind::Processing);
+                                        self.error = None;
+                                        let sender = self.worker_tx.clone();
+                                        let samples = Arc::clone(&self.audio_samples);
+                                        std::thread::spawn(move || {
+                                            let result = audio::process(&samples, FFT_BLOCK_SIZE)
+                                                .map_err(|error| error.to_string());
+                                            let _ = sender.send(WorkerMessage::Processed(result));
+                                        });
+                                    }
+                                    let audio_status = match self.busy {
+                                        Some(WorkerKind::Decoding) => "Loading",
+                                        Some(WorkerKind::Processing) => "Working",
+                                        None if !self.spectrum.is_empty() => "Ready",
+                                        None if !self.audio_samples.is_empty() => "Loaded",
+                                        None => "No audio",
+                                    };
+                                    let status_color = if !self.spectrum.is_empty() {
+                                        egui::Color32::from_rgb(119, 207, 170)
+                                    } else {
+                                        egui::Color32::from_rgb(154, 164, 180)
+                                    };
+                                    ui.label(
+                                        egui::RichText::new(audio_status)
+                                            .small()
+                                            .color(status_color),
+                                    );
+                                });
+                                if !self.spectrum.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{} analyzed frames",
+                                            self.spectrum.len() / visuals::SPECTRUM_BINS
+                                        ))
+                                        .small()
+                                        .color(egui::Color32::from_rgb(139, 153, 173)),
+                                    );
+                                }
+                                ui.add_space(18.0);
+                                ui.separator();
+                                ui.add_space(12.0);
+
+                                ui.label(
+                                    egui::RichText::new("SCENE")
+                                        .small()
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(139, 153, 173)),
+                                );
+                                ui.add_space(5.0);
+                                egui::ComboBox::from_id_salt("visual_scene")
+                                    .selected_text(self.scene.label())
+                                    .width(248.0)
+                                    .show_ui(ui, |ui| {
+                                        for scene in visuals::Scene::ALL {
+                                            if ui
+                                                .selectable_value(
+                                                    &mut self.scene,
+                                                    scene,
+                                                    scene.label(),
+                                                )
+                                                .clicked()
+                                                && scene != visuals::Scene::Reactive
+                                            {
+                                                self.reactive_rendering = false;
+                                            }
+                                        }
+                                    });
+                                ui.add_space(8.0);
+                                let toggle_label = if self.reactive_rendering {
+                                    "Stop Reactive Preview"
+                                } else {
+                                    "Start Reactive Preview"
+                                };
+                                let toggle_button =
+                                    egui::Button::new(egui::RichText::new(toggle_label).strong())
+                                        .fill(if self.reactive_rendering {
+                                            egui::Color32::from_rgb(74, 91, 103)
+                                        } else {
+                                            egui::Color32::from_rgb(46, 132, 117)
+                                        })
+                                        .min_size(egui::vec2(256.0, 38.0));
+                                if ui
+                                    .add_enabled(
+                                        !self.exporting
+                                            && (self.reactive_rendering
+                                                || self.shader_pipeline.is_some()),
+                                        toggle_button,
+                                    )
+                                    .clicked()
+                                {
+                                    self.reactive_rendering = !self.reactive_rendering;
+                                    if self.reactive_rendering {
+                                        self.scene = visuals::Scene::Reactive;
+                                        self.preview_started = Instant::now();
+                                    }
+                                }
+                                if let Some(error) = &self.shader_error {
+                                    ui.add_space(4.0);
+                                    ui.colored_label(egui::Color32::LIGHT_RED, error);
+                                } else if self.reactive_rendering
+                                    && let Some(warning) = &self.shader_warning
+                                {
+                                    ui.add_space(4.0);
+                                    ui.colored_label(egui::Color32::YELLOW, warning);
+                                }
+                                ui.add_space(18.0);
+                                ui.separator();
+                                ui.add_space(12.0);
+
+                                ui.label(
+                                    egui::RichText::new("COLOR PALETTE")
+                                        .small()
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(139, 153, 173)),
+                                );
+                                ui.add_space(6.0);
+                                ui.add_enabled_ui(!self.exporting, |ui| {
+                                    ui.horizontal_wrapped(|ui| {
+                                        for palette in Palette::PRESETS {
+                                            let selected = self.palette == palette;
+                                            let (primary, secondary) = palette
+                                                .colors()
+                                                .expect("preset palette has colors");
+                                            ui.horizontal(|ui| {
+                                                ui.label(egui::RichText::new("●").color(primary));
+                                                ui.label(egui::RichText::new("●").color(secondary));
+                                                if ui
+                                                    .selectable_label(selected, palette.label())
+                                                    .clicked()
+                                                {
+                                                    self.palette = palette;
+                                                    self.primary_color = primary;
+                                                    self.secondary_color = secondary;
+                                                }
+                                            });
+                                        }
+                                        if ui
+                                            .selectable_label(
+                                                self.palette == Palette::Custom,
+                                                "Custom colors",
+                                            )
+                                            .clicked()
+                                        {
+                                            self.palette = Palette::Custom;
+                                        }
+                                    });
+                                    ui.add_space(5.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label("Primary");
+                                        if ui
+                                            .color_edit_button_srgba(&mut self.primary_color)
+                                            .changed()
+                                        {
+                                            self.palette = Palette::Custom;
+                                        }
+                                        ui.add_space(8.0);
+                                        ui.label("Secondary");
+                                        if ui
+                                            .color_edit_button_srgba(&mut self.secondary_color)
+                                            .changed()
+                                        {
+                                            self.palette = Palette::Custom;
+                                        }
+                                    });
+                                });
+                                ui.add_space(18.0);
+                                ui.separator();
+                                ui.add_space(12.0);
+
+                                ui.label(
+                                    egui::RichText::new("EXPORT")
+                                        .small()
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(139, 153, 173)),
+                                );
+                                ui.add_space(5.0);
+                                ui.add_enabled_ui(!self.exporting, |ui| {
+                                    egui::ComboBox::from_id_salt("export_resolution")
+                                        .selected_text(self.export_resolution.label())
+                                        .width(248.0)
+                                        .show_ui(ui, |ui| {
+                                            for resolution in ExportResolution::ALL {
+                                                ui.selectable_value(
+                                                    &mut self.export_resolution,
+                                                    resolution,
+                                                    resolution.label(),
+                                                );
+                                            }
+                                        });
+                                });
+                                ui.add_space(7.0);
+                                let export_label = if self.exporting {
+                                    "Rendering MP4..."
+                                } else {
+                                    "Export 16-second loop"
+                                };
+                                if ui
+                                    .add_enabled(
+                                        !self.exporting && self.shader_pipeline.is_some(),
+                                        egui::Button::new(export_label)
+                                            .min_size(egui::vec2(256.0, 36.0)),
+                                    )
+                                    .clicked()
+                                    && let Some(output) = rfd::FileDialog::new()
+                                        .add_filter("MP4 video", &["mp4"])
+                                        .set_file_name("reactive-loop.mp4")
+                                        .save_file()
+                                {
+                                    self.start_export(output);
+                                }
+                                if self.exporting {
+                                    match self.export_controller.lock() {
+                                        Ok(controller) => {
+                                            if let Some(capture) = &controller.capture {
+                                                let progress = capture.next_frame as f32
+                                                    / capture.frame_count as f32;
+                                                ui.add(
+                                                    egui::ProgressBar::new(progress)
+                                                        .desired_width(256.0)
+                                                        .show_percentage(),
+                                                );
+                                            } else {
+                                                ui.label("Finishing video encoding...");
+                                            }
+                                        }
+                                        Err(_) => {
+                                            ui.colored_label(
+                                                egui::Color32::LIGHT_RED,
+                                                "Export status unavailable",
+                                            );
+                                        }
+                                    }
+                                }
+                                ui.label(
+                                    egui::RichText::new("Silent MP4 · 30 fps · Requires FFmpeg")
+                                        .small()
+                                        .color(egui::Color32::from_rgb(139, 153, 173)),
+                                );
+                                if let Some(error) = &self.export_error {
+                                    ui.add_space(4.0);
+                                    ui.colored_label(egui::Color32::LIGHT_RED, error);
+                                }
+                                if let Some(error) = &self.error {
+                                    ui.add_space(4.0);
+                                    ui.colored_label(egui::Color32::LIGHT_RED, error);
+                                }
+                            });
                         });
-                });
-
-                let export_label = if self.exporting {
-                    "Exporting Reactive MP4..."
-                } else {
-                    "Export 16s Reactive MP4"
-                };
-                if ui
-                    .add_enabled(
-                        !self.exporting && self.shader_pipeline.is_some(),
-                        egui::Button::new(export_label),
-                    )
-                    .clicked()
-                    && let Some(output) = rfd::FileDialog::new()
-                        .add_filter("MP4 video", &["mp4"])
-                        .set_file_name("reactive-loop.mp4")
-                        .save_file()
-                {
-                    self.start_export(output);
-                }
-
-                if self.exporting {
-                    match self.export_controller.lock() {
-                        Ok(controller) => {
-                            if let Some(capture) = &controller.capture {
-                                let progress =
-                                    capture.next_frame as f32 / capture.frame_count as f32;
-                                ui.add(egui::ProgressBar::new(progress).show_percentage());
-                            } else {
-                                ui.label("Finishing MP4 encoding...");
-                            }
-                        }
-                        Err(_) => {
-                            ui.colored_label(egui::Color32::RED, "Export status unavailable");
-                        }
-                    }
-                }
-            });
-            ui.label(
-                "Exports a silent 16-second MP4 at 30 fps; analyzed audio drives the visuals. Requires FFmpeg.",
-            );
-            if let Some(error) = &self.export_error {
-                ui.colored_label(egui::Color32::RED, error);
-            }
-
-            ui.horizontal(|ui| {
-                if let Some(file) = &self.selected_file {
-                    ui.label(file.file_name().unwrap_or_default().to_string_lossy());
-                } else {
-                    ui.label("Choose an audio file to drive the visuals");
-                }
-                match self.busy {
-                    Some(WorkerKind::Decoding) => ui.label("Decoding audio..."),
-                    Some(WorkerKind::Processing) => ui.label("Analyzing spectrum..."),
-                    None if !self.spectrum.is_empty() => ui.label(format!(
-                        "{} spectrum frames",
-                        self.spectrum.len() / visuals::SPECTRUM_BINS
-                    )),
-                    None => ui.label("Preview loop is running"),
-                };
-            });
-
-            let (preview_rect, _) = ui.allocate_at_least(
-                ui.available_size_before_wrap()
-                    .max(egui::vec2(360.0, 280.0)),
-                egui::Sense::hover(),
-            );
-            visuals::render(
-                &ui.painter_at(preview_rect),
-                preview_rect,
-                &self.spectrum,
-                self.preview_started.elapsed().as_secs_f32(),
-                self.scene,
-                if self.reactive_rendering {
-                    self.shader_pipeline.as_ref()
-                } else {
-                    None
                 },
-                &mut self.audio_smoother,
-                ui.input(|input| input.stable_dt),
-                self.primary_color,
-                self.secondary_color,
-                Arc::clone(&self.export_controller),
             );
-            if let Some(error) = &self.error {
-                ui.colored_label(egui::Color32::RED, error);
-            }
+            ui.separator();
+
+            ui.allocate_ui_with_layout(
+                ui.available_size(),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_rgb(13, 16, 22))
+                        .inner_margin(egui::Margin::same(22))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.heading("Preview");
+                                ui.add_space(8.0);
+                                ui.label(
+                                    egui::RichText::new(self.scene.label())
+                                        .color(egui::Color32::from_rgb(157, 170, 188)),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if self.exporting {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(237, 191, 111),
+                                                "EXPORTING",
+                                            );
+                                        } else if self.scene == visuals::Scene::Reactive
+                                            && self.reactive_rendering
+                                        {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(119, 207, 170),
+                                                "● LIVE",
+                                            );
+                                        } else {
+                                            ui.label(
+                                                egui::RichText::new("PREVIEW")
+                                                    .small()
+                                                    .color(egui::Color32::from_rgb(139, 153, 173)),
+                                            );
+                                        }
+                                    },
+                                );
+                            });
+                            ui.add_space(12.0);
+
+                            let available = ui.available_rect_before_wrap();
+                            let frame_rect = egui::Rect::from_center_size(
+                                available.center(),
+                                egui::vec2(
+                                    available.width().min(available.height() * 16.0 / 9.0),
+                                    available.height().min(available.width() * 9.0 / 16.0),
+                                ),
+                            );
+                            ui.painter().rect_filled(
+                                frame_rect.expand(7.0),
+                                12.0,
+                                egui::Color32::from_rgb(27, 32, 42),
+                            );
+                            ui.painter().rect_filled(
+                                frame_rect,
+                                6.0,
+                                egui::Color32::from_rgb(7, 10, 17),
+                            );
+                            visuals::render(
+                                &ui.painter_at(frame_rect),
+                                frame_rect,
+                                &self.spectrum,
+                                self.preview_started.elapsed().as_secs_f32(),
+                                self.scene,
+                                if self.reactive_rendering {
+                                    self.shader_pipeline.as_ref()
+                                } else {
+                                    None
+                                },
+                                &mut self.audio_smoother,
+                                ui.input(|input| input.stable_dt),
+                                self.primary_color,
+                                self.secondary_color,
+                                Arc::clone(&self.export_controller),
+                            );
+                            ui.allocate_rect(available, egui::Sense::hover());
+                        });
+                },
+            );
         });
     }
 }
