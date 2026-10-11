@@ -3,7 +3,7 @@ name = "showViewer"
 description = "a simple vj loop renderer"
 version = "0.1.0"
 edition = "2024"
-liscense = "MIT"
+license = "MIT"
 repository = "https://github.com/HugoBrisebois/pre-show-scene-viewer"
 
 [dependencies]
