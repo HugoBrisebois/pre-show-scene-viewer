@@ -1,0 +1,14 @@
+## showViewer
+
+this project is an idea on how to generate custom vj loops based on an audio file and the frequecies produced from it.
+
+## why build this
+as someone who makes visuals for shows, i was curious to see if i could generate vj loops, and so this is the prototype
+
+## to use
+
+in order to use this, you can just install it via cargo using:
+
+```
+cargo install showViewer
+```
