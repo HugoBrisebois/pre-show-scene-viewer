@@ -11,14 +11,22 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
+pub struct AudioTrack {
+    pub samples: Vec<f32>,
+    pub sample_rate: u32,
+    pub duration_seconds: f64,
+}
+
 pub fn open_file() -> Option<PathBuf> {
     FileDialog::new()
-        .add_filter("audio", &["mp3", "wav", "flac"])
-        .set_directory("/")
+        .add_filter(
+            "Audio",
+            &["mp3", "wav", "flac", "ogg", "opus", "m4a", "aac"],
+        )
         .pick_file()
 }
 
-pub fn analyze(path: &Path) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+pub fn analyze(path: &Path) -> Result<AudioTrack, Box<dyn std::error::Error>> {
     let file = File::open(path)?;
     let mms = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
@@ -46,6 +54,11 @@ pub fn analyze(path: &Path) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
         symphonia::default::get_codecs().make(&codec_params, &DecoderOptions::default())?;
 
     let mut samples = Vec::new();
+    let mut sample_rate = codec_params.sample_rate.unwrap_or(0);
+    let mut channel_count = codec_params
+        .channels
+        .map(|channels| channels.count())
+        .unwrap_or(0);
     loop {
         let packet = match format.next_packet() {
             Ok(packet) => packet,
@@ -61,17 +74,37 @@ pub fn analyze(path: &Path) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
 
         match decoder.decode(&packet) {
             Ok(decoded) => {
-                let mut sample_buffer =
-                    SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
+                let spec = *decoded.spec();
+                sample_rate = spec.rate;
+                channel_count = spec.channels.count();
+                let mut sample_buffer = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
                 sample_buffer.copy_interleaved_ref(decoded);
-                samples.extend_from_slice(sample_buffer.samples());
+                let channels = channel_count.max(1);
+                samples.extend(
+                    sample_buffer
+                        .samples()
+                        .chunks(channels)
+                        .map(|frame| frame.iter().sum::<f32>() / frame.len() as f32),
+                );
             }
             Err(SymphoniaError::DecodeError(_)) => continue,
             Err(error) => return Err(Box::new(error)),
         }
     }
 
-    Ok(samples)
+    if sample_rate == 0 || channel_count == 0 || samples.is_empty() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "audio track contains no decodable samples",
+        )
+        .into());
+    }
+    let duration_seconds = samples.len() as f64 / f64::from(sample_rate);
+    Ok(AudioTrack {
+        samples,
+        sample_rate,
+        duration_seconds,
+    })
 }
 
 pub fn process(
@@ -106,4 +139,48 @@ pub fn process(
     }
 
     Ok(magnitudes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::analyze;
+    use std::process::Command;
+
+    #[test]
+    fn decoded_audio_reports_sample_rate_and_full_duration() {
+        if Command::new("ffmpeg").arg("-version").output().is_err() {
+            eprintln!("Skipping audio metadata test: ffmpeg is not installed");
+            return;
+        }
+
+        let path =
+            std::env::temp_dir().join(format!("showviewer-audio-test-{}.wav", std::process::id()));
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=44100",
+                "-t",
+                "0.25",
+                "-ac",
+                "2",
+                "-c:a",
+                "pcm_s16le",
+            ])
+            .arg(&path)
+            .status()
+            .expect("ffmpeg should create test audio");
+        assert!(status.success());
+
+        let track = analyze(&path).expect("the generated WAV should decode");
+        assert_eq!(track.sample_rate, 44_100);
+        assert!((track.duration_seconds - 0.25).abs() < 0.002);
+        assert!((track.samples.len() as f64 - 11_025.0).abs() < 90.0);
+        std::fs::remove_file(path).unwrap();
+    }
 }

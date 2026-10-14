@@ -1,6 +1,6 @@
 [package]
 name = "showViewer"
-description = "a simple vj loop renderer"
+description = "Audio-reactive visuals with synchronized playback and full-track video export"
 version = "0.1.3"
 edition = "2024"
 license = "MIT"

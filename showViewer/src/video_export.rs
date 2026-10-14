@@ -5,8 +5,6 @@ use std::sync::mpsc::{self, Sender, SyncSender};
 use std::thread;
 
 pub const EXPORT_FPS: u32 = 30;
-pub const EXPORT_DURATION_SECONDS: u32 = 16;
-pub const EXPORT_FRAME_COUNT: usize = (EXPORT_FPS * EXPORT_DURATION_SECONDS) as usize;
 
 pub enum ExportMessage {
     Frame(Vec<u8>),
@@ -17,13 +15,23 @@ pub fn start_mp4_encoder(
     output: &Path,
     width: u32,
     height: u32,
+    audio_path: &Path,
+    duration_seconds: f64,
     completion_sender: Sender<Result<(), String>>,
 ) -> SyncSender<ExportMessage> {
     let (frame_sender, frame_receiver) = mpsc::sync_channel(3);
     let output = output.to_owned();
+    let audio_path = audio_path.to_owned();
 
     thread::spawn(move || {
-        let result = encode_mp4(&output, width, height, frame_receiver);
+        let result = encode_mp4(
+            &output,
+            width,
+            height,
+            &audio_path,
+            duration_seconds,
+            frame_receiver,
+        );
         let _ = completion_sender.send(result);
     });
 
@@ -34,6 +42,8 @@ fn encode_mp4(
     output: &Path,
     width: u32,
     height: u32,
+    audio_path: &Path,
+    duration_seconds: f64,
     frame_receiver: mpsc::Receiver<ExportMessage>,
 ) -> Result<(), String> {
     let mut child = Command::new("ffmpeg")
@@ -52,7 +62,14 @@ fn encode_mp4(
             &EXPORT_FPS.to_string(),
             "-i",
             "pipe:0",
-            "-an",
+            "-i",
+        ])
+        .arg(audio_path)
+        .args([
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
             "-c:v",
             "libx264",
             "-preset",
@@ -61,6 +78,13 @@ fn encode_mp4(
             "18",
             "-pix_fmt",
             "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-t",
+            &format!("{duration_seconds:.6}"),
+            "-shortest",
             "-movflags",
             "+faststart",
         ])
@@ -131,8 +155,29 @@ mod tests {
         let output =
             std::env::temp_dir().join(format!("showviewer-export-test-{}.mp4", std::process::id()));
         let (completion_sender, completion_receiver) = mpsc::channel();
-        let frame_sender = start_mp4_encoder(&output, 64, 64, completion_sender);
-        for _ in 0..4 {
+        let audio_path = std::env::temp_dir().join("showviewer-export-test.wav");
+        let audio_status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=44100:cl=stereo",
+                "-t",
+                "0.2",
+                "-c:a",
+                "pcm_s16le",
+            ])
+            .arg(&audio_path)
+            .status()
+            .expect("ffmpeg should create test audio");
+        assert!(audio_status.success());
+
+        let frame_sender = start_mp4_encoder(&output, 64, 64, &audio_path, 0.2, completion_sender);
+        for _ in 0..6 {
             frame_sender
                 .send(ExportMessage::Frame(vec![24; 64 * 64 * 4]))
                 .expect("encoder thread should accept frames");
@@ -162,6 +207,40 @@ mod tests {
         {
             assert_eq!(String::from_utf8_lossy(&probe.stdout).trim(), "h264,64,64");
         }
+        let probe = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_name",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(&output)
+            .output()
+            .expect("ffprobe should inspect the exported MP4");
+        let codecs = String::from_utf8_lossy(&probe.stdout);
+        assert!(codecs.lines().any(|codec| codec == "h264"));
+        assert!(codecs.lines().any(|codec| codec == "aac"));
+
+        let duration = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+            ])
+            .arg(&output)
+            .output()
+            .expect("ffprobe should report the exported duration");
+        let duration = String::from_utf8_lossy(&duration.stdout)
+            .trim()
+            .parse::<f64>()
+            .expect("ffprobe should report a numeric duration");
+        assert!((0.19..=0.22).contains(&duration));
         std::fs::remove_file(output).unwrap();
+        std::fs::remove_file(audio_path).unwrap();
     }
 }

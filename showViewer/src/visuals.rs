@@ -29,15 +29,11 @@ pub fn export_audio_controls(spectrum: &[f32], frame_count: usize, fps: u32) -> 
     let delta_seconds = 1.0 / fps.max(1) as f32;
     let mut smoother = AudioSmoother::default();
     let mut controls = Vec::with_capacity(frame_count);
-    for cycle in 0..2 {
-        for frame_index in 0..frame_count {
-            let phase = frame_index as f32 / frame_count.max(1) as f32;
-            let (bass, mids, treble) = spectrum_energies(spectrum, phase);
-            let (bass, mids, treble, onset) = smoother.update(bass, mids, treble, delta_seconds);
-            if cycle == 1 {
-                controls.push([bass, mids, treble, onset]);
-            }
-        }
+    for frame_index in 0..frame_count {
+        let phase = frame_index as f32 / frame_count.max(1) as f32;
+        let (bass, mids, treble) = spectrum_energies(spectrum, phase);
+        let (bass, mids, treble, onset) = smoother.update(bass, mids, treble, delta_seconds);
+        controls.push([bass, mids, treble, onset]);
     }
     controls
 }
@@ -449,7 +445,8 @@ fn render_export_frame(
         controller.error = Some("Export audio analysis has too few frame values".to_owned());
         return;
     };
-    let time = capture.next_frame as f32 / capture.frame_count as f32 * TAU;
+    let time =
+        capture.next_frame as f32 / crate::video_export::EXPORT_FPS as f32 / LOOP_SECONDS * TAU;
     let aspect = capture.width as f32 / capture.height as f32;
     let primary_color = color_to_rgb(capture.primary_color);
     let secondary_color = color_to_rgb(capture.secondary_color);
@@ -718,6 +715,7 @@ pub fn render(
     rect: Rect,
     spectrum: &[f32],
     elapsed_seconds: f32,
+    audio_duration_seconds: f32,
     scene: Scene,
     shader_pipeline: Option<&VjShaderPipeline>,
     audio_smoother: &mut AudioSmoother,
@@ -726,7 +724,11 @@ pub fn render(
     secondary_color: Color32,
     export_controller: Arc<Mutex<ExportController>>,
 ) {
-    let phase = elapsed_seconds.rem_euclid(LOOP_SECONDS) / LOOP_SECONDS;
+    let phase = if audio_duration_seconds > 0.0 {
+        (elapsed_seconds / audio_duration_seconds).clamp(0.0, 0.999_999)
+    } else {
+        elapsed_seconds.rem_euclid(LOOP_SECONDS) / LOOP_SECONDS
+    };
     let (bass, mids, highs) = spectrum_energies(spectrum, phase);
     let energy = (bass * 0.45 + mids * 0.35 + highs * 0.2).clamp(0.0, 1.0);
 
@@ -737,7 +739,7 @@ pub fn render(
                     audio_smoother.update(bass, mids, highs, delta_seconds);
                 painter.add(pipeline.paint_callback(
                     rect,
-                    phase * TAU,
+                    elapsed_seconds / LOOP_SECONDS * TAU,
                     smoothed_bass,
                     smoothed_mids,
                     smoothed_treble,
@@ -1017,5 +1019,17 @@ mod tests {
         let controls = super::export_audio_controls(&[], 480, 30);
         assert_eq!(controls.len(), 480);
         assert!(controls.iter().all(|frame| frame.iter().all(|v| *v == 0.0)));
+    }
+
+    #[test]
+    fn export_audio_controls_follow_the_entire_spectrum_timeline() {
+        let mut spectrum = vec![0.0; SPECTRUM_BINS * 2];
+        spectrum[1..32].fill(1.0);
+        spectrum[SPECTRUM_BINS + 160..].fill(1.0);
+
+        let controls = super::export_audio_controls(&spectrum, 60, 30);
+        assert_eq!(controls.len(), 60);
+        assert!(controls[0][0] > controls[0][2]);
+        assert!(controls[30][2] > controls[30][0]);
     }
 }

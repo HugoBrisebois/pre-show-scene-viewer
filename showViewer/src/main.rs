@@ -2,7 +2,8 @@ pub mod audio;
 pub mod video_export;
 pub mod visuals;
 use eframe::egui;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -13,10 +14,13 @@ fn main() -> eframe::Result<()> {
     // init the window
     let native_options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1280.0, 820.0])
+            .with_min_inner_size([960.0, 640.0]),
         ..Default::default()
     };
     eframe::run_native(
-        "ShowViewer",
+        "ShowViewer — Audio Reactive Visuals",
         native_options,
         Box::new(|cc| Ok(Box::new(ShowViewer::new(cc)))),
     )
@@ -24,7 +28,8 @@ fn main() -> eframe::Result<()> {
 
 struct ShowViewer {
     selected_file: Option<PathBuf>,
-    audio_samples: Arc<[f32]>,
+    audio_duration_seconds: f64,
+    audio_sample_rate: u32,
     spectrum: Vec<f32>,
     error: Option<String>,
     worker_tx: Sender<WorkerMessage>,
@@ -44,10 +49,15 @@ struct ShowViewer {
     export_controller: Arc<Mutex<visuals::ExportController>>,
     exporting: bool,
     export_error: Option<String>,
+    export_success: Option<String>,
+    export_output: Option<PathBuf>,
+    playback_process: Option<Child>,
+    playback_started: Option<Instant>,
+    playback_position_seconds: f64,
 }
 
 enum WorkerMessage {
-    Decoded(Result<Vec<f32>, String>),
+    Decoded(Result<audio::AudioTrack, String>),
     Processed(Result<Vec<f32>, String>),
     Exported(Result<(), String>),
 }
@@ -158,7 +168,8 @@ impl ShowViewer {
         };
         Self {
             selected_file: None,
-            audio_samples: Arc::from([]),
+            audio_duration_seconds: 0.0,
+            audio_sample_rate: 0,
             spectrum: Vec::new(),
             error: None,
             worker_tx,
@@ -178,15 +189,41 @@ impl ShowViewer {
             export_controller: Arc::new(Mutex::new(visuals::ExportController::default())),
             exporting: false,
             export_error: None,
+            export_success: None,
+            export_output: None,
+            playback_process: None,
+            playback_started: None,
+            playback_position_seconds: 0.0,
         }
     }
 
     fn start_export(&mut self, output: PathBuf) {
+        if let Err(error) = self.pause_audio() {
+            self.export_error = Some(error);
+            return;
+        }
+        let Some(audio_path) = self.selected_file.as_deref() else {
+            self.export_error = Some("Choose an audio file before exporting".to_owned());
+            return;
+        };
+        if self.audio_duration_seconds <= 0.0 || !self.audio_duration_seconds.is_finite() {
+            self.export_error = Some("The selected audio file has no valid duration".to_owned());
+            return;
+        }
         let output = output.with_extension("mp4");
+        self.export_output = Some(output.clone());
         let (width, height) = self.export_resolution.dimensions();
+        let frame_count =
+            (self.audio_duration_seconds * f64::from(video_export::EXPORT_FPS)).ceil() as usize;
         let (completion_sender, completion_receiver) = mpsc::channel();
-        let frame_sender =
-            video_export::start_mp4_encoder(&output, width, height, completion_sender);
+        let frame_sender = video_export::start_mp4_encoder(
+            &output,
+            width,
+            height,
+            audio_path,
+            self.audio_duration_seconds,
+            completion_sender,
+        );
         let worker_sender = self.worker_tx.clone();
         std::thread::spawn(move || {
             let result = completion_receiver
@@ -195,15 +232,12 @@ impl ShowViewer {
             let _ = worker_sender.send(WorkerMessage::Exported(result));
         });
 
-        let audio_controls = visuals::export_audio_controls(
-            &self.spectrum,
-            video_export::EXPORT_FRAME_COUNT,
-            video_export::EXPORT_FPS,
-        );
+        let audio_controls =
+            visuals::export_audio_controls(&self.spectrum, frame_count, video_export::EXPORT_FPS);
         let capture = visuals::ExportCapture {
             width,
             height,
-            frame_count: video_export::EXPORT_FRAME_COUNT,
+            frame_count,
             next_frame: 0,
             audio_controls,
             primary_color: self.primary_color,
@@ -211,15 +245,16 @@ impl ShowViewer {
             frame_sender,
         };
 
+        self.export_success = None;
         match self.export_controller.lock() {
             Ok(mut controller) => {
                 controller.capture = Some(capture);
                 controller.error = None;
                 self.export_error = None;
+                self.export_success = None;
                 self.exporting = true;
                 self.scene = visuals::Scene::Reactive;
                 self.reactive_rendering = true;
-                self.preview_started = Instant::now();
             }
             Err(_) => {
                 self.export_error =
@@ -227,15 +262,147 @@ impl ShowViewer {
             }
         }
     }
+
+    fn export_disabled_reason(&self) -> Option<&'static str> {
+        if self.exporting {
+            return Some("An export is already in progress.");
+        }
+        match self.busy {
+            Some(WorkerKind::Decoding) => return Some("Wait for the audio file to load."),
+            Some(WorkerKind::Processing) => {
+                return Some("Wait for audio analysis to finish before exporting.");
+            }
+            None => {}
+        }
+        if self.selected_file.is_none() {
+            return Some("Load an audio file to export a full-length render.");
+        }
+        if !self.audio_duration_seconds.is_finite() || self.audio_duration_seconds <= 0.0 {
+            return Some("The selected audio file has no valid duration.");
+        }
+        if self.spectrum.is_empty() {
+            return Some("Audio analysis is unavailable; try loading the audio file again.");
+        }
+        if self.shader_pipeline.is_none() {
+            return Some("Reactive rendering requires an available OpenGL renderer.");
+        }
+        None
+    }
+
+    fn play_audio(&mut self) -> Result<(), String> {
+        let Some(file) = self.selected_file.as_ref() else {
+            return Err("Choose an audio file before starting playback".to_owned());
+        };
+        if self.audio_duration_seconds <= 0.0 {
+            return Err("The selected audio file has no playable duration".to_owned());
+        }
+        if self.playback_position_seconds >= self.audio_duration_seconds {
+            self.playback_position_seconds = 0.0;
+        }
+
+        let child = Command::new("ffplay")
+            .args([
+                "-nodisp",
+                "-autoexit",
+                "-loglevel",
+                "error",
+                "-ss",
+                &format!("{:.3}", self.playback_position_seconds),
+                "-i",
+            ])
+            .arg(file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("Could not start audio playback with FFplay: {error}"))?;
+
+        self.playback_process = Some(child);
+        self.playback_started = Some(Instant::now());
+        self.scene = visuals::Scene::Reactive;
+        self.reactive_rendering = true;
+        Ok(())
+    }
+
+    fn pause_audio(&mut self) -> Result<(), String> {
+        if let Some(started) = self.playback_started.take() {
+            self.playback_position_seconds = (self.playback_position_seconds
+                + started.elapsed().as_secs_f64())
+            .min(self.audio_duration_seconds);
+        }
+        if let Some(mut child) = self.playback_process.take() {
+            let already_finished = match child.try_wait() {
+                Ok(status) => status.is_some(),
+                Err(error) => {
+                    self.playback_process = Some(child);
+                    return Err(format!("Could not check audio playback: {error}"));
+                }
+            };
+            if !already_finished && let Err(error) = child.kill() {
+                self.playback_process = Some(child);
+                return Err(format!("Could not stop audio playback: {error}"));
+            }
+            child
+                .wait()
+                .map_err(|error| format!("Could not stop audio playback: {error}"))?;
+        }
+        Ok(())
+    }
+
+    fn audio_position_seconds(&mut self) -> f64 {
+        let Some(started) = self.playback_started else {
+            return self.playback_position_seconds;
+        };
+        let position = (self.playback_position_seconds + started.elapsed().as_secs_f64())
+            .min(self.audio_duration_seconds);
+        let process_status = self.playback_process.as_mut().map(Child::try_wait);
+        let process_finished = match process_status {
+            Some(Ok(Some(status))) => {
+                if !status.success() {
+                    self.error = Some(format!("Audio playback stopped with exit status {status}"));
+                }
+                true
+            }
+            Some(Err(error)) => {
+                self.error = Some(format!("Could not check audio playback: {error}"));
+                true
+            }
+            _ => false,
+        };
+        let finished = position >= self.audio_duration_seconds || process_finished;
+        if finished {
+            self.playback_position_seconds = position;
+            self.playback_started = None;
+            if let Some(mut child) = self.playback_process.take()
+                && let Err(error) = child.wait()
+            {
+                self.error = Some(format!("Could not finish audio playback: {error}"));
+            }
+        }
+        position
+    }
+}
+
+impl Drop for ShowViewer {
+    fn drop(&mut self) {
+        let _ = self.pause_audio();
+    }
 }
 
 impl eframe::App for ShowViewer {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         while let Ok(message) = self.worker_rx.try_recv() {
             match message {
-                WorkerMessage::Decoded(Ok(samples)) => {
-                    self.audio_samples = Arc::from(samples);
-                    self.busy = None;
+                WorkerMessage::Decoded(Ok(track)) => {
+                    self.audio_duration_seconds = track.duration_seconds;
+                    self.audio_sample_rate = track.sample_rate;
+                    self.busy = Some(WorkerKind::Processing);
+                    let sender = self.worker_tx.clone();
+                    std::thread::spawn(move || {
+                        let result = audio::process(&track.samples, FFT_BLOCK_SIZE)
+                            .map_err(|error| error.to_string());
+                        let _ = sender.send(WorkerMessage::Processed(result));
+                    });
                 }
                 WorkerMessage::Decoded(Err(error)) => {
                     self.error = Some(error);
@@ -255,9 +422,18 @@ impl eframe::App for ShowViewer {
                         Ok(mut controller) => controller.error.take(),
                         Err(_) => Some("Could not retrieve MP4 export status".to_owned()),
                     };
+                    if self.export_error.is_none() {
+                        let output = self
+                            .export_output
+                            .as_ref()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| "selected file".to_owned());
+                        self.export_success = Some(format!("Saved full-track render: {output}"));
+                    }
                 }
                 WorkerMessage::Exported(Err(error)) => {
                     self.exporting = false;
+                    self.export_success = None;
                     let render_error = match self.export_controller.lock() {
                         Ok(mut controller) => controller.error.take(),
                         Err(_) => Some("Export render status is unavailable".to_owned()),
@@ -273,6 +449,7 @@ impl eframe::App for ShowViewer {
         }
 
         ui.ctx().request_repaint_after(Duration::from_millis(16));
+        let audio_position_seconds = self.audio_position_seconds() as f32;
 
         let available_size = ui.available_size();
         ui.horizontal(|ui| {
@@ -290,6 +467,13 @@ impl eframe::App for ShowViewer {
                                     egui::RichText::new("AUDIO-REACTIVE VISUALS")
                                         .small()
                                         .color(egui::Color32::from_rgb(139, 153, 173)),
+                                );
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Sync playback, shape the look, export the full track.",
+                                    )
+                                    .small()
+                                    .color(egui::Color32::from_rgb(139, 153, 173)),
                                 );
                                 ui.add_space(18.0);
 
@@ -309,15 +493,21 @@ impl eframe::App for ShowViewer {
                                     .clicked()
                                     && let Some(file) = audio::open_file()
                                 {
-                                    self.selected_file = Some(file.clone());
-                                    self.audio_samples = Arc::from([]);
-                                    self.spectrum.clear();
                                     self.error = None;
+                                    if let Err(error) = self.pause_audio() {
+                                        self.error = Some(error);
+                                    }
+                                    self.selected_file = Some(file.clone());
+                                    self.audio_duration_seconds = 0.0;
+                                    self.audio_sample_rate = 0;
+                                    self.playback_position_seconds = 0.0;
+                                    self.spectrum.clear();
+                                    self.export_success = None;
                                     self.busy = Some(WorkerKind::Decoding);
                                     let sender = self.worker_tx.clone();
                                     let display_path = file.display().to_string();
                                     std::thread::spawn(move || {
-                                        let result = start_analysis(&file).map_err(|error| {
+                                        let result = audio::analyze(&file).map_err(|error| {
                                             format!("Could not analyze {display_path}: {error}")
                                         });
                                         let _ = sender.send(WorkerMessage::Decoded(result));
@@ -335,38 +525,17 @@ impl eframe::App for ShowViewer {
                                 }
                                 ui.add_space(6.0);
                                 ui.horizontal(|ui| {
-                                    let analyze_label = match self.busy {
-                                        Some(WorkerKind::Decoding) => "Decoding audio...",
-                                        Some(WorkerKind::Processing) => "Analyzing...",
-                                        None => "Analyze audio",
-                                    };
-                                    if ui
-                                        .add_enabled(
-                                            self.busy.is_none()
-                                                && !self.exporting
-                                                && !self.audio_samples.is_empty(),
-                                            egui::Button::new(analyze_label),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.busy = Some(WorkerKind::Processing);
-                                        self.error = None;
-                                        let sender = self.worker_tx.clone();
-                                        let samples = Arc::clone(&self.audio_samples);
-                                        std::thread::spawn(move || {
-                                            let result = audio::process(&samples, FFT_BLOCK_SIZE)
-                                                .map_err(|error| error.to_string());
-                                            let _ = sender.send(WorkerMessage::Processed(result));
-                                        });
-                                    }
                                     let audio_status = match self.busy {
-                                        Some(WorkerKind::Decoding) => "Loading",
-                                        Some(WorkerKind::Processing) => "Working",
+                                        Some(WorkerKind::Decoding) => "Loading audio...",
+                                        Some(WorkerKind::Processing) => "Analyzing audio...",
+                                        None if self.playback_started.is_some() => "Playing",
                                         None if !self.spectrum.is_empty() => "Ready",
-                                        None if !self.audio_samples.is_empty() => "Loaded",
+                                        None if self.error.is_some() => "Audio error",
                                         None => "No audio",
                                     };
-                                    let status_color = if !self.spectrum.is_empty() {
+                                    let status_color = if self.error.is_some() {
+                                        egui::Color32::LIGHT_RED
+                                    } else if !self.spectrum.is_empty() {
                                         egui::Color32::from_rgb(119, 207, 170)
                                     } else {
                                         egui::Color32::from_rgb(154, 164, 180)
@@ -376,11 +545,16 @@ impl eframe::App for ShowViewer {
                                             .small()
                                             .color(status_color),
                                     );
+                                    if self.busy.is_some() {
+                                        ui.spinner();
+                                    }
                                 });
-                                if !self.spectrum.is_empty() {
+                                if self.audio_duration_seconds > 0.0 {
                                     ui.label(
                                         egui::RichText::new(format!(
-                                            "{} analyzed frames",
+                                            "{} · {} Hz · {} analyzed frames",
+                                            format_time(self.audio_duration_seconds),
+                                            self.audio_sample_rate,
                                             self.spectrum.len() / visuals::SPECTRUM_BINS
                                         ))
                                         .small()
@@ -443,6 +617,8 @@ impl eframe::App for ShowViewer {
                                     if self.reactive_rendering {
                                         self.scene = visuals::Scene::Reactive;
                                         self.preview_started = Instant::now();
+                                    } else if let Err(error) = self.pause_audio() {
+                                        self.error = Some(error);
                                     }
                                 }
                                 if let Some(error) = &self.shader_error {
@@ -541,20 +717,21 @@ impl eframe::App for ShowViewer {
                                 });
                                 ui.add_space(7.0);
                                 let export_label = if self.exporting {
-                                    "Rendering MP4..."
+                                    "Rendering full track..."
                                 } else {
-                                    "Export 16-second loop"
+                                    "Export full audio render"
                                 };
+                                let export_disabled_reason = self.export_disabled_reason();
                                 if ui
                                     .add_enabled(
-                                        !self.exporting && self.shader_pipeline.is_some(),
+                                        export_disabled_reason.is_none(),
                                         egui::Button::new(export_label)
                                             .min_size(egui::vec2(256.0, 36.0)),
                                     )
                                     .clicked()
                                     && let Some(output) = rfd::FileDialog::new()
                                         .add_filter("MP4 video", &["mp4"])
-                                        .set_file_name("reactive-loop.mp4")
+                                        .set_file_name("audio-reactive-render.mp4")
                                         .save_file()
                                 {
                                     self.start_export(output);
@@ -570,8 +747,27 @@ impl eframe::App for ShowViewer {
                                                         .desired_width(256.0)
                                                         .show_percentage(),
                                                 );
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "{} / {} · frame {} of {}",
+                                                        format_time(
+                                                            capture.next_frame as f64
+                                                                / f64::from(
+                                                                    video_export::EXPORT_FPS
+                                                                )
+                                                        ),
+                                                        format_time(self.audio_duration_seconds),
+                                                        capture.next_frame.min(capture.frame_count),
+                                                        capture.frame_count
+                                                    ))
+                                                    .small()
+                                                    .color(egui::Color32::from_rgb(157, 170, 188)),
+                                                );
                                             } else {
-                                                ui.label("Finishing video encoding...");
+                                                ui.horizontal(|ui| {
+                                                    ui.spinner();
+                                                    ui.label("Finishing video encoding...");
+                                                });
                                             }
                                         }
                                         Err(_) => {
@@ -581,15 +777,46 @@ impl eframe::App for ShowViewer {
                                             );
                                         }
                                     }
+                                } else if let Some(reason) = export_disabled_reason {
+                                    ui.label(
+                                        egui::RichText::new(reason)
+                                            .small()
+                                            .color(egui::Color32::from_rgb(184, 164, 128)),
+                                    );
                                 }
                                 ui.label(
-                                    egui::RichText::new("Silent MP4 · 30 fps · Requires FFmpeg")
+                                    egui::RichText::new(format!(
+                                        "Reactive video + source audio · H.264 + AAC · 30 fps · {}",
+                                        if self.audio_duration_seconds > 0.0 {
+                                            format_time(self.audio_duration_seconds)
+                                        } else {
+                                            "load audio to enable export".to_owned()
+                                        }
+                                    ))
+                                    .small()
+                                    .color(egui::Color32::from_rgb(139, 153, 173)),
+                                );
+                                if self.shader_pipeline.is_none() {
+                                    ui.colored_label(
+                                        egui::Color32::LIGHT_RED,
+                                        "Reactive rendering is unavailable on this system.",
+                                    );
+                                }
+                                ui.label(
+                                    egui::RichText::new("Requires FFmpeg with libx264 on PATH.")
                                         .small()
                                         .color(egui::Color32::from_rgb(139, 153, 173)),
                                 );
                                 if let Some(error) = &self.export_error {
                                     ui.add_space(4.0);
                                     ui.colored_label(egui::Color32::LIGHT_RED, error);
+                                }
+                                if let Some(success) = &self.export_success {
+                                    ui.add_space(4.0);
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(119, 207, 170),
+                                        success,
+                                    );
                                 }
                                 if let Some(error) = &self.error {
                                     ui.add_space(4.0);
@@ -624,12 +851,18 @@ impl eframe::App for ShowViewer {
                                                 egui::Color32::from_rgb(237, 191, 111),
                                                 "EXPORTING",
                                             );
+                                        } else if self.playback_started.is_some() {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(119, 207, 170),
+                                                "● PLAYING",
+                                            );
                                         } else if self.scene == visuals::Scene::Reactive
                                             && self.reactive_rendering
                                         {
-                                            ui.colored_label(
-                                                egui::Color32::from_rgb(119, 207, 170),
-                                                "● LIVE",
+                                            ui.label(
+                                                egui::RichText::new("REACTIVE PREVIEW")
+                                                    .small()
+                                                    .color(egui::Color32::from_rgb(139, 153, 173)),
                                             );
                                         } else {
                                             ui.label(
@@ -644,11 +877,18 @@ impl eframe::App for ShowViewer {
                             ui.add_space(12.0);
 
                             let available = ui.available_rect_before_wrap();
+                            let preview_area = egui::Rect::from_min_max(
+                                available.min,
+                                egui::pos2(
+                                    available.max.x,
+                                    (available.max.y - 48.0).max(available.min.y),
+                                ),
+                            );
                             let frame_rect = egui::Rect::from_center_size(
-                                available.center(),
+                                preview_area.center(),
                                 egui::vec2(
-                                    available.width().min(available.height() * 16.0 / 9.0),
-                                    available.height().min(available.width() * 9.0 / 16.0),
+                                    preview_area.width().min(preview_area.height() * 16.0 / 9.0),
+                                    preview_area.height().min(preview_area.width() * 9.0 / 16.0),
                                 ),
                             );
                             ui.painter().rect_filled(
@@ -665,7 +905,12 @@ impl eframe::App for ShowViewer {
                                 &ui.painter_at(frame_rect),
                                 frame_rect,
                                 &self.spectrum,
-                                self.preview_started.elapsed().as_secs_f32(),
+                                if self.audio_duration_seconds > 0.0 {
+                                    audio_position_seconds
+                                } else {
+                                    self.preview_started.elapsed().as_secs_f32()
+                                },
+                                self.audio_duration_seconds as f32,
                                 self.scene,
                                 if self.reactive_rendering {
                                     self.shader_pipeline.as_ref()
@@ -678,7 +923,95 @@ impl eframe::App for ShowViewer {
                                 self.secondary_color,
                                 Arc::clone(&self.export_controller),
                             );
-                            ui.allocate_rect(available, egui::Sense::hover());
+                            if self.selected_file.is_none() {
+                                ui.painter().text(
+                                    frame_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "Load an audio file to begin",
+                                    egui::FontId::proportional(20.0),
+                                    egui::Color32::from_rgb(175, 187, 201),
+                                );
+                            } else if self.busy.is_some() {
+                                let status = match self.busy {
+                                    Some(WorkerKind::Decoding) => "Loading audio…",
+                                    Some(WorkerKind::Processing) => "Analyzing audio…",
+                                    None => unreachable!(),
+                                };
+                                ui.painter().text(
+                                    frame_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    status,
+                                    egui::FontId::proportional(18.0),
+                                    egui::Color32::from_rgb(175, 187, 201),
+                                );
+                            } else if self.spectrum.is_empty() {
+                                ui.painter().text(
+                                    frame_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "Audio analysis unavailable",
+                                    egui::FontId::proportional(18.0),
+                                    egui::Color32::from_rgb(175, 187, 201),
+                                );
+                            }
+                            ui.allocate_rect(preview_area, egui::Sense::hover());
+                            ui.add_space(5.0);
+                            let mut requested_position = audio_position_seconds as f64;
+                            ui.horizontal(|ui| {
+                                let playing = self.playback_started.is_some();
+                                if ui
+                                    .add_enabled(
+                                        self.audio_duration_seconds > 0.0
+                                            && self.busy.is_none()
+                                            && !self.exporting,
+                                        egui::Button::new(if playing { "Pause" } else { "Play" })
+                                            .min_size(egui::vec2(64.0, 30.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    if playing {
+                                        if let Err(error) = self.pause_audio() {
+                                            self.error = Some(error);
+                                        }
+                                    } else if let Err(error) = self.play_audio() {
+                                        self.error = Some(error);
+                                    }
+                                }
+
+                                let slider_width = (ui.available_width() - 116.0).max(80.0);
+                                let response = ui
+                                    .add_enabled_ui(
+                                        self.audio_duration_seconds > 0.0 && !self.exporting,
+                                        |ui| {
+                                            ui.add_sized(
+                                                [slider_width, 24.0],
+                                                egui::Slider::new(
+                                                    &mut requested_position,
+                                                    0.0..=self.audio_duration_seconds.max(0.01),
+                                                )
+                                                .show_value(false)
+                                                .trailing_fill(true)
+                                                .fixed_decimals(1),
+                                            )
+                                        },
+                                    )
+                                    .inner;
+                                if response.changed() {
+                                    let was_playing = self.playback_started.is_some();
+                                    if let Err(error) = self.pause_audio() {
+                                        self.error = Some(error);
+                                    }
+                                    self.playback_position_seconds = requested_position;
+                                    self.audio_smoother = visuals::AudioSmoother::default();
+                                    if was_playing && let Err(error) = self.play_audio() {
+                                        self.error = Some(error);
+                                    }
+                                }
+                                ui.label(format!(
+                                    "{} / {}",
+                                    format_time(requested_position),
+                                    format_time(self.audio_duration_seconds)
+                                ));
+                            });
                         });
                 },
             );
@@ -686,6 +1019,10 @@ impl eframe::App for ShowViewer {
     }
 }
 
-fn start_analysis(file: &Path) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-    audio::analyze(file)
+fn format_time(seconds: f64) -> String {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return "0:00".to_owned();
+    }
+    let total_seconds = seconds.floor() as u64;
+    format!("{}:{:02}", total_seconds / 60, total_seconds % 60)
 }
