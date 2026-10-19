@@ -3,16 +3,24 @@ use eframe::egui_glow::CallbackFn;
 use eframe::glow::{self, HasContext as _};
 use egui::{Color32, Painter, Pos2, Rect, Shape, Stroke};
 use std::f32::consts::TAU;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, mpsc::SyncSender};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const SPECTRUM_BINS: usize = 513;
-const LOOP_SECONDS: f32 = 16.0;
+pub const LOOP_SECONDS: f32 = 16.0;
+const VJ_SEED_MASK: u32 = 0x00ff_ffff;
+static VJ_SEED_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 pub struct ExportCapture {
     pub width: u32,
     pub height: u32,
     pub frame_count: usize,
     pub next_frame: usize,
+    pub vj_loops: bool,
+    pub multi_band_vj: bool,
+    pub audio_reactive: bool,
+    pub vj_seed: f32,
     pub audio_controls: Vec<[f32; 4]>,
     pub primary_color: Color32,
     pub secondary_color: Color32,
@@ -23,6 +31,16 @@ pub struct ExportCapture {
 pub struct ExportController {
     pub capture: Option<ExportCapture>,
     pub error: Option<String>,
+}
+
+pub fn new_vj_seed() -> f32 {
+    let time_seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos()
+        & VJ_SEED_MASK;
+    let sequence = VJ_SEED_COUNTER.fetch_add(1, Ordering::Relaxed) & VJ_SEED_MASK;
+    time_seed.wrapping_add(sequence) as f32 / (VJ_SEED_MASK + 1) as f32
 }
 
 pub fn export_audio_controls(spectrum: &[f32], frame_count: usize, fps: u32) -> Vec<[f32; 4]> {
@@ -51,6 +69,10 @@ pub struct VjShaderPipeline {
     aspect_uniform: Option<glow::UniformLocation>,
     primary_color_uniform: Option<glow::UniformLocation>,
     secondary_color_uniform: Option<glow::UniformLocation>,
+    vj_loops_uniform: Option<glow::UniformLocation>,
+    multi_band_vj_uniform: Option<glow::UniformLocation>,
+    audio_reactive_uniform: Option<glow::UniformLocation>,
+    vj_seed_uniform: Option<glow::UniformLocation>,
     uniform_warning: Option<String>,
     export_target: Arc<Mutex<Option<OffscreenTarget>>>,
 }
@@ -146,6 +168,10 @@ impl VjShaderPipeline {
                 gl.get_uniform_location(program, "u_aspect"),
                 gl.get_uniform_location(program, "u_primary_color"),
                 gl.get_uniform_location(program, "u_secondary_color"),
+                gl.get_uniform_location(program, "u_vj_loops"),
+                gl.get_uniform_location(program, "u_multiband_vj"),
+                gl.get_uniform_location(program, "u_vj_seed"),
+                gl.get_uniform_location(program, "u_audio_reactive"),
             )
         };
         let (
@@ -157,6 +183,10 @@ impl VjShaderPipeline {
             aspect_uniform,
             primary_color_uniform,
             secondary_color_uniform,
+            vj_loops_uniform,
+            multi_band_vj_uniform,
+            vj_seed_uniform,
+            audio_reactive_uniform,
         ) = uniforms;
         let missing_uniforms = [
             ("u_time", time_uniform.is_none()),
@@ -167,6 +197,10 @@ impl VjShaderPipeline {
             ("u_aspect", aspect_uniform.is_none()),
             ("u_primary_color", primary_color_uniform.is_none()),
             ("u_secondary_color", secondary_color_uniform.is_none()),
+            ("u_vj_loops", vj_loops_uniform.is_none()),
+            ("u_multiband_vj", multi_band_vj_uniform.is_none()),
+            ("u_vj_seed", vj_seed_uniform.is_none()),
+            ("u_audio_reactive", audio_reactive_uniform.is_none()),
         ]
         .into_iter()
         .filter_map(|(name, missing)| missing.then_some(name))
@@ -236,6 +270,10 @@ impl VjShaderPipeline {
             aspect_uniform,
             primary_color_uniform,
             secondary_color_uniform,
+            vj_loops_uniform,
+            multi_band_vj_uniform,
+            vj_seed_uniform,
+            audio_reactive_uniform,
             uniform_warning,
             export_target: Arc::new(Mutex::new(None)),
         })
@@ -253,9 +291,13 @@ impl VjShaderPipeline {
         mids: f32,
         treble: f32,
         onset: f32,
+        vj_loops: bool,
+        audio_reactive: bool,
+        vj_seed: f32,
         primary_color: Color32,
         secondary_color: Color32,
         export_controller: Arc<Mutex<ExportController>>,
+        multi_band_vj: bool,
     ) -> PaintCallback {
         let gl = Arc::clone(&self.gl);
         let program = self.program;
@@ -268,6 +310,10 @@ impl VjShaderPipeline {
         let aspect_uniform = self.aspect_uniform;
         let primary_color_uniform = self.primary_color_uniform;
         let secondary_color_uniform = self.secondary_color_uniform;
+        let vj_loops_uniform = self.vj_loops_uniform;
+        let multi_band_vj_uniform = self.multi_band_vj_uniform;
+        let vj_seed_uniform = self.vj_seed_uniform;
+        let audio_reactive_uniform = self.audio_reactive_uniform;
         let aspect = rect.width() / rect.height().max(1.0);
         let primary_color = color_to_rgb(primary_color);
         let secondary_color = color_to_rgb(secondary_color);
@@ -288,11 +334,19 @@ impl VjShaderPipeline {
                     &aspect_uniform,
                     &primary_color_uniform,
                     &secondary_color_uniform,
+                    &vj_loops_uniform,
+                    &multi_band_vj_uniform,
+                    &vj_seed_uniform,
+                    &audio_reactive_uniform,
                     time,
                     bass,
                     mids,
                     treble,
                     onset,
+                    vj_loops,
+                    multi_band_vj,
+                    audio_reactive,
+                    vj_seed,
                     aspect,
                     primary_color,
                     secondary_color,
@@ -309,6 +363,10 @@ impl VjShaderPipeline {
                     &aspect_uniform,
                     &primary_color_uniform,
                     &secondary_color_uniform,
+                    &vj_loops_uniform,
+                    &multi_band_vj_uniform,
+                    &vj_seed_uniform,
+                    &audio_reactive_uniform,
                     &export_target,
                     &export_controller,
                 );
@@ -330,11 +388,19 @@ fn draw_shader(
     aspect_uniform: &Option<glow::UniformLocation>,
     primary_color_uniform: &Option<glow::UniformLocation>,
     secondary_color_uniform: &Option<glow::UniformLocation>,
+    vj_loops_uniform: &Option<glow::UniformLocation>,
+    multi_band_vj_uniform: &Option<glow::UniformLocation>,
+    vj_seed_uniform: &Option<glow::UniformLocation>,
+    audio_reactive_uniform: &Option<glow::UniformLocation>,
     time: f32,
     bass: f32,
     mids: f32,
     treble: f32,
     onset: f32,
+    vj_loops: bool,
+    multi_band_vj: bool,
+    audio_reactive: bool,
+    vj_seed: f32,
     aspect: f32,
     primary_color: [f32; 3],
     secondary_color: [f32; 3],
@@ -373,6 +439,10 @@ fn draw_shader(
                 secondary_color[2],
             );
         }
+        gl.uniform_1_i32(vj_loops_uniform.as_ref(), i32::from(vj_loops));
+        gl.uniform_1_i32(multi_band_vj_uniform.as_ref(), i32::from(multi_band_vj));
+        gl.uniform_1_f32(vj_seed_uniform.as_ref(), vj_seed);
+        gl.uniform_1_i32(audio_reactive_uniform.as_ref(), i32::from(audio_reactive));
         gl.bind_vertex_array(Some(vertex_array));
         gl.draw_arrays(glow::TRIANGLES, 0, 6);
     }
@@ -391,6 +461,10 @@ fn render_export_frame(
     aspect_uniform: &Option<glow::UniformLocation>,
     primary_color_uniform: &Option<glow::UniformLocation>,
     secondary_color_uniform: &Option<glow::UniformLocation>,
+    vj_loops_uniform: &Option<glow::UniformLocation>,
+    multi_band_vj_uniform: &Option<glow::UniformLocation>,
+    vj_seed_uniform: &Option<glow::UniformLocation>,
+    audio_reactive_uniform: &Option<glow::UniformLocation>,
     export_target: &Arc<Mutex<Option<OffscreenTarget>>>,
     export_controller: &Arc<Mutex<ExportController>>,
 ) {
@@ -470,11 +544,19 @@ fn render_export_frame(
             aspect_uniform,
             primary_color_uniform,
             secondary_color_uniform,
+            vj_loops_uniform,
+            multi_band_vj_uniform,
+            vj_seed_uniform,
+            audio_reactive_uniform,
             time,
             bass,
             mids,
             treble,
             onset,
+            capture.vj_loops,
+            capture.multi_band_vj,
+            capture.audio_reactive,
+            capture.vj_seed,
             aspect,
             primary_color,
             secondary_color,
@@ -690,14 +772,18 @@ pub enum Scene {
     Orbit,
     Kaleidoscope,
     Reactive,
+    VjLoops,
+    MultiBandVj,
 }
 
 impl Scene {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 6] = [
         Self::Aurora,
         Self::Orbit,
         Self::Kaleidoscope,
         Self::Reactive,
+        Self::VjLoops,
+        Self::MultiBandVj,
     ];
 
     pub fn label(self) -> &'static str {
@@ -706,7 +792,17 @@ impl Scene {
             Self::Orbit => "Orbit",
             Self::Kaleidoscope => "Kaleidoscope",
             Self::Reactive => "Reactive",
+            Self::VjLoops => "VJ Loops",
+            Self::MultiBandVj => "Multi-band VJ",
         }
+    }
+
+    pub fn uses_shader(self) -> bool {
+        matches!(self, Self::Reactive | Self::VjLoops | Self::MultiBandVj)
+    }
+
+    pub fn is_vj_mode(self) -> bool {
+        matches!(self, Self::VjLoops | Self::MultiBandVj)
     }
 }
 
@@ -720,6 +816,8 @@ pub fn render(
     shader_pipeline: Option<&VjShaderPipeline>,
     audio_smoother: &mut AudioSmoother,
     delta_seconds: f32,
+    vj_seed: f32,
+    audio_reactive: bool,
     primary_color: Color32,
     secondary_color: Color32,
     export_controller: Arc<Mutex<ExportController>>,
@@ -733,20 +831,29 @@ pub fn render(
     let energy = (bass * 0.45 + mids * 0.35 + highs * 0.2).clamp(0.0, 1.0);
 
     match scene {
-        Scene::Reactive => {
+        Scene::Reactive | Scene::VjLoops | Scene::MultiBandVj => {
             if let Some(pipeline) = shader_pipeline {
                 let (smoothed_bass, smoothed_mids, smoothed_treble, onset) =
                     audio_smoother.update(bass, mids, highs, delta_seconds);
+                let shader_time = if scene.is_vj_mode() && !audio_reactive {
+                    vj_loop_time(elapsed_seconds)
+                } else {
+                    elapsed_seconds / LOOP_SECONDS * TAU
+                };
                 painter.add(pipeline.paint_callback(
                     rect,
-                    elapsed_seconds / LOOP_SECONDS * TAU,
+                    shader_time,
                     smoothed_bass,
                     smoothed_mids,
                     smoothed_treble,
                     onset,
+                    scene == Scene::VjLoops,
+                    audio_reactive,
+                    vj_seed,
                     primary_color,
                     secondary_color,
                     Arc::clone(&export_controller),
+                    scene == Scene::MultiBandVj,
                 ));
             } else {
                 painter.rect_filled(rect, 4.0, Color32::from_rgb(7, 10, 24));
@@ -764,10 +871,14 @@ pub fn render(
                 Scene::Kaleidoscope => {
                     draw_kaleidoscope(painter, rect, &frame, phase, bass, mids, highs)
                 }
-                Scene::Reactive => unreachable!(),
+                Scene::Reactive | Scene::VjLoops | Scene::MultiBandVj => unreachable!(),
             }
         }
     }
+}
+
+fn vj_loop_time(elapsed_seconds: f32) -> f32 {
+    elapsed_seconds.rem_euclid(LOOP_SECONDS) / LOOP_SECONDS * TAU
 }
 
 fn spectrum_energies(spectrum: &[f32], phase: f32) -> (f32, f32, f32) {
@@ -813,7 +924,7 @@ fn band_energy(frame: &[f32], bins: std::ops::Range<usize>) -> f32 {
     if values.is_empty() {
         0.0
     } else {
-        values.iter().sum::<f32>() / values.len() as f32
+        (values.iter().map(|value| value * value).sum::<f32>() / values.len() as f32).sqrt()
     }
 }
 
@@ -978,7 +1089,38 @@ fn draw_kaleidoscope(
 
 #[cfg(test)]
 mod tests {
-    use super::{AudioSmoother, SPECTRUM_BINS, spectrum_frame};
+    use super::{
+        AudioSmoother, LOOP_SECONDS, SPECTRUM_BINS, Scene, new_vj_seed, spectrum_frame,
+        vj_loop_time,
+    };
+
+    #[test]
+    fn each_vj_render_gets_a_new_finite_seed() {
+        let first = new_vj_seed();
+        let second = new_vj_seed();
+
+        assert!(first.is_finite() && (0.0..1.0).contains(&first));
+        assert!(second.is_finite() && (0.0..1.0).contains(&second));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn vj_loops_is_a_distinct_shader_scene() {
+        assert_eq!(Scene::VjLoops.label(), "VJ Loops");
+        assert!(Scene::VjLoops.uses_shader());
+        assert_eq!(Scene::MultiBandVj.label(), "Multi-band VJ");
+        assert!(Scene::MultiBandVj.uses_shader());
+        assert!(Scene::MultiBandVj.is_vj_mode());
+        assert!(Scene::VjLoops.is_vj_mode());
+        assert!(Scene::Reactive.uses_shader());
+        assert!(!Scene::Aurora.uses_shader());
+    }
+
+    #[test]
+    fn autonomous_vj_time_wraps_at_the_loop_boundary() {
+        assert_eq!(vj_loop_time(0.0), vj_loop_time(LOOP_SECONDS));
+        assert_eq!(vj_loop_time(3.5), vj_loop_time(LOOP_SECONDS + 3.5));
+    }
 
     #[test]
     fn spectrum_frame_interpolates_and_wraps_between_frames() {
@@ -1031,5 +1173,25 @@ mod tests {
         assert_eq!(controls.len(), 60);
         assert!(controls[0][0] > controls[0][2]);
         assert!(controls[30][2] > controls[30][0]);
+    }
+
+    #[test]
+    fn spectrum_energy_identifies_low_mid_and_high_frequency_tones() {
+        let mut spectrum = vec![0.0; SPECTRUM_BINS];
+        for (tone_bin, expected_band) in [(8, 0), (80, 1), (300, 2)] {
+            spectrum.fill(0.0);
+            spectrum[tone_bin] = 1.0;
+            let (bass, mids, treble) = super::spectrum_energies(&spectrum, 0.0);
+            let energies = [bass, mids, treble];
+            let strongest_band = energies
+                .iter()
+                .enumerate()
+                .max_by(|(_, left), (_, right)| left.total_cmp(right))
+                .map(|(index, _)| index)
+                .expect("spectrum should include frequency bands");
+
+            assert_eq!(strongest_band, expected_band);
+            assert!(energies[expected_band] > 0.0);
+        }
     }
 }

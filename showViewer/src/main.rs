@@ -36,6 +36,8 @@ struct ShowViewer {
     worker_rx: Receiver<WorkerMessage>,
     busy: Option<WorkerKind>,
     scene: visuals::Scene,
+    vj_seed: f32,
+    vj_audio_reactive: bool,
     preview_started: Instant,
     reactive_rendering: bool,
     shader_pipeline: Option<visuals::VjShaderPipeline>,
@@ -143,6 +145,16 @@ enum WorkerKind {
 }
 
 impl ShowViewer {
+    fn select_scene(&mut self, scene: visuals::Scene) {
+        self.scene = scene;
+        self.reactive_rendering = scene.uses_shader();
+        if scene.is_vj_mode() {
+            self.vj_seed = visuals::new_vj_seed();
+            self.preview_started = Instant::now();
+            self.audio_smoother = visuals::AudioSmoother::default();
+        }
+    }
+
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut app_visuals = egui::Visuals::dark();
         app_visuals.panel_fill = egui::Color32::from_rgb(13, 16, 22);
@@ -176,6 +188,8 @@ impl ShowViewer {
             worker_rx,
             busy: None,
             scene: visuals::Scene::Reactive,
+            vj_seed: visuals::new_vj_seed(),
+            vj_audio_reactive: true,
             preview_started: Instant::now(),
             reactive_rendering: false,
             shader_pipeline,
@@ -202,26 +216,43 @@ impl ShowViewer {
             self.export_error = Some(error);
             return;
         }
-        let Some(audio_path) = self.selected_file.as_deref() else {
-            self.export_error = Some("Choose an audio file before exporting".to_owned());
-            return;
+        let standalone_loop = self.scene.is_vj_mode() && !self.vj_audio_reactive;
+        let audio_path = if standalone_loop {
+            None
+        } else {
+            let Some(audio_path) = self.selected_file.as_deref() else {
+                self.export_error = Some("Choose an audio file before exporting".to_owned());
+                return;
+            };
+            if self.audio_duration_seconds <= 0.0 || !self.audio_duration_seconds.is_finite() {
+                self.export_error =
+                    Some("The selected audio file has no valid duration".to_owned());
+                return;
+            }
+            Some(audio_path)
         };
-        if self.audio_duration_seconds <= 0.0 || !self.audio_duration_seconds.is_finite() {
-            self.export_error = Some("The selected audio file has no valid duration".to_owned());
-            return;
-        }
+        let duration_seconds = if standalone_loop {
+            f64::from(visuals::LOOP_SECONDS)
+        } else {
+            self.audio_duration_seconds
+        };
         let output = output.with_extension("mp4");
         self.export_output = Some(output.clone());
+        let vj_loops = self.scene.is_vj_mode();
+        let multi_band_vj = self.scene == visuals::Scene::MultiBandVj;
+        let audio_reactive = !standalone_loop;
+        if vj_loops {
+            self.vj_seed = visuals::new_vj_seed();
+        }
         let (width, height) = self.export_resolution.dimensions();
-        let frame_count =
-            (self.audio_duration_seconds * f64::from(video_export::EXPORT_FPS)).ceil() as usize;
+        let frame_count = (duration_seconds * f64::from(video_export::EXPORT_FPS)).ceil() as usize;
         let (completion_sender, completion_receiver) = mpsc::channel();
         let frame_sender = video_export::start_mp4_encoder(
             &output,
             width,
             height,
             audio_path,
-            self.audio_duration_seconds,
+            duration_seconds,
             completion_sender,
         );
         let worker_sender = self.worker_tx.clone();
@@ -232,13 +263,20 @@ impl ShowViewer {
             let _ = worker_sender.send(WorkerMessage::Exported(result));
         });
 
-        let audio_controls =
-            visuals::export_audio_controls(&self.spectrum, frame_count, video_export::EXPORT_FPS);
+        let audio_controls = if audio_reactive {
+            visuals::export_audio_controls(&self.spectrum, frame_count, video_export::EXPORT_FPS)
+        } else {
+            vec![[0.0; 4]; frame_count]
+        };
         let capture = visuals::ExportCapture {
             width,
             height,
             frame_count,
             next_frame: 0,
+            vj_loops,
+            multi_band_vj,
+            audio_reactive,
+            vj_seed: self.vj_seed,
             audio_controls,
             primary_color: self.primary_color,
             secondary_color: self.secondary_color,
@@ -253,7 +291,9 @@ impl ShowViewer {
                 self.export_error = None;
                 self.export_success = None;
                 self.exporting = true;
-                self.scene = visuals::Scene::Reactive;
+                if !vj_loops {
+                    self.scene = visuals::Scene::Reactive;
+                }
                 self.reactive_rendering = true;
             }
             Err(_) => {
@@ -266,6 +306,13 @@ impl ShowViewer {
     fn export_disabled_reason(&self) -> Option<&'static str> {
         if self.exporting {
             return Some("An export is already in progress.");
+        }
+        let standalone_loop = self.scene.is_vj_mode() && !self.vj_audio_reactive;
+        if standalone_loop {
+            if self.shader_pipeline.is_none() {
+                return Some("VJ loop rendering requires an available OpenGL renderer.");
+            }
+            return None;
         }
         match self.busy {
             Some(WorkerKind::Decoding) => return Some("Wait for the audio file to load."),
@@ -319,8 +366,7 @@ impl ShowViewer {
 
         self.playback_process = Some(child);
         self.playback_started = Some(Instant::now());
-        self.scene = visuals::Scene::Reactive;
-        self.reactive_rendering = true;
+        self.reactive_rendering = self.scene.uses_shader();
         Ok(())
     }
 
@@ -584,17 +630,39 @@ impl eframe::App for ShowViewer {
                                                     scene.label(),
                                                 )
                                                 .clicked()
-                                                && scene != visuals::Scene::Reactive
                                             {
-                                                self.reactive_rendering = false;
+                                                self.select_scene(scene);
                                             }
                                         }
                                     });
+                                let multi_band_selected =
+                                    self.scene == visuals::Scene::MultiBandVj;
+                                if ui
+                                    .add_sized(
+                                        [256.0, 34.0],
+                                        egui::Button::new(
+                                            egui::RichText::new("Multi-band VJ")
+                                                .strong()
+                                                .color(egui::Color32::WHITE),
+                                        )
+                                        .fill(if multi_band_selected {
+                                            egui::Color32::from_rgb(63, 116, 150)
+                                        } else {
+                                            egui::Color32::from_rgb(46, 88, 119)
+                                        }),
+                                    )
+                                    .on_hover_text(
+                                        "Bass pulses · midrange warps geometry · treble adds spokes and sparkles",
+                                    )
+                                    .clicked()
+                                {
+                                    self.select_scene(visuals::Scene::MultiBandVj);
+                                }
                                 ui.add_space(8.0);
                                 let toggle_label = if self.reactive_rendering {
-                                    "Stop Reactive Preview"
+                                    "Stop Shader Preview"
                                 } else {
-                                    "Start Reactive Preview"
+                                    "Start Shader Preview"
                                 };
                                 let toggle_button =
                                     egui::Button::new(egui::RichText::new(toggle_label).strong())
@@ -615,11 +683,86 @@ impl eframe::App for ShowViewer {
                                 {
                                     self.reactive_rendering = !self.reactive_rendering;
                                     if self.reactive_rendering {
-                                        self.scene = visuals::Scene::Reactive;
+                                        if !self.scene.uses_shader() {
+                                            self.scene = visuals::Scene::Reactive;
+                                        } else if self.scene.is_vj_mode() {
+                                            self.vj_seed = visuals::new_vj_seed();
+                                        }
                                         self.preview_started = Instant::now();
+                                        if self.selected_file.is_some()
+                                            && self.busy.is_none()
+                                            && self.playback_started.is_none()
+                                            && (!self.scene.is_vj_mode() || self.vj_audio_reactive)
+                                            && let Err(error) = self.play_audio()
+                                        {
+                                            self.error = Some(error);
+                                        }
                                     } else if let Err(error) = self.pause_audio() {
                                         self.error = Some(error);
                                     }
+                                }
+                                if self.scene.is_vj_mode()
+                                    && ui
+                                        .add_enabled(
+                                            !self.exporting,
+                                            egui::Button::new("Generate new VJ composition")
+                                                .min_size(egui::vec2(256.0, 32.0)),
+                                        )
+                                        .clicked()
+                                {
+                                    self.vj_seed = visuals::new_vj_seed();
+                                    self.audio_smoother = visuals::AudioSmoother::default();
+                                    self.preview_started = Instant::now();
+                                }
+                                if self.scene.is_vj_mode() {
+                                    ui.add_space(8.0);
+                                    ui.label(
+                                        egui::RichText::new("LOOP DRIVE")
+                                            .small()
+                                            .strong()
+                                            .color(egui::Color32::from_rgb(139, 153, 173)),
+                                    );
+                                    let mode_changed = ui
+                                        .horizontal(|ui| {
+                                            let audio_changed = ui
+                                                .radio_value(
+                                                    &mut self.vj_audio_reactive,
+                                                    true,
+                                                    "Audio reactive",
+                                                )
+                                                .changed();
+                                            let autonomous_changed = ui
+                                                .radio_value(
+                                                    &mut self.vj_audio_reactive,
+                                                    false,
+                                                    "Self-running",
+                                                )
+                                                .changed();
+                                            audio_changed || autonomous_changed
+                                        })
+                                        .inner;
+                                    if mode_changed {
+                                        self.preview_started = Instant::now();
+                                        self.audio_smoother = visuals::AudioSmoother::default();
+                                        if !self.vj_audio_reactive
+                                            && let Err(error) = self.pause_audio()
+                                        {
+                                            self.error = Some(error);
+                                        }
+                                    }
+                                    ui.label(
+                                        egui::RichText::new(
+                                            if self.scene == visuals::Scene::MultiBandVj {
+                                                "Bass pulses · mids warp geometry · highs spark."
+                                            } else if self.vj_audio_reactive {
+                                                "Shape the loop with the selected track."
+                                            } else {
+                                                "A standalone 16-second loop; no audio needed."
+                                            },
+                                        )
+                                        .small()
+                                        .color(egui::Color32::from_rgb(139, 153, 173)),
+                                    );
                                 }
                                 if let Some(error) = &self.shader_error {
                                     ui.add_space(4.0);
@@ -716,8 +859,16 @@ impl eframe::App for ShowViewer {
                                         });
                                 });
                                 ui.add_space(7.0);
+                                let standalone_vj_loop =
+                                    self.scene.is_vj_mode() && !self.vj_audio_reactive;
                                 let export_label = if self.exporting {
-                                    "Rendering full track..."
+                                    if standalone_vj_loop {
+                                        "Rendering VJ loop..."
+                                    } else {
+                                        "Rendering full track..."
+                                    }
+                                } else if standalone_vj_loop {
+                                    "Export 16-second VJ loop"
                                 } else {
                                     "Export full audio render"
                                 };
@@ -731,7 +882,23 @@ impl eframe::App for ShowViewer {
                                     .clicked()
                                     && let Some(output) = rfd::FileDialog::new()
                                         .add_filter("MP4 video", &["mp4"])
-                                        .set_file_name("audio-reactive-render.mp4")
+                                        .set_file_name(if self.scene.is_vj_mode() {
+                                            if standalone_vj_loop {
+                                                if self.scene == visuals::Scene::MultiBandVj {
+                                                    "multiband-vj-loop.mp4"
+                                                } else {
+                                                    "vj-loop.mp4"
+                                                }
+                                            } else {
+                                                if self.scene == visuals::Scene::MultiBandVj {
+                                                    "multiband-vj-audio-reactive.mp4"
+                                                } else {
+                                                    "vj-audio-reactive.mp4"
+                                                }
+                                            }
+                                        } else {
+                                            "audio-reactive-render.mp4"
+                                        })
                                         .save_file()
                                 {
                                     self.start_export(output);
@@ -756,7 +923,12 @@ impl eframe::App for ShowViewer {
                                                                     video_export::EXPORT_FPS
                                                                 )
                                                         ),
-                                                        format_time(self.audio_duration_seconds),
+                                                        format_time(
+                                                            capture.frame_count as f64
+                                                                / f64::from(
+                                                                    video_export::EXPORT_FPS
+                                                                )
+                                                        ),
                                                         capture.next_frame.min(capture.frame_count),
                                                         capture.frame_count
                                                     ))
@@ -784,17 +956,25 @@ impl eframe::App for ShowViewer {
                                             .color(egui::Color32::from_rgb(184, 164, 128)),
                                     );
                                 }
-                                ui.label(
-                                    egui::RichText::new(format!(
+                                let export_description = if standalone_vj_loop {
+                                    format!(
+                                        "Standalone seamless VJ loop · H.264 · 30 fps · {}",
+                                        format_time(f64::from(visuals::LOOP_SECONDS))
+                                    )
+                                } else {
+                                    format!(
                                         "Reactive video + source audio · H.264 + AAC · 30 fps · {}",
                                         if self.audio_duration_seconds > 0.0 {
                                             format_time(self.audio_duration_seconds)
                                         } else {
                                             "load audio to enable export".to_owned()
                                         }
-                                    ))
-                                    .small()
-                                    .color(egui::Color32::from_rgb(139, 153, 173)),
+                                    )
+                                };
+                                ui.label(
+                                    egui::RichText::new(export_description)
+                                        .small()
+                                        .color(egui::Color32::from_rgb(139, 153, 173)),
                                 );
                                 if self.shader_pipeline.is_none() {
                                     ui.colored_label(
@@ -901,15 +1081,19 @@ impl eframe::App for ShowViewer {
                                 6.0,
                                 egui::Color32::from_rgb(7, 10, 17),
                             );
+                            let visual_time = if self.scene.is_vj_mode() && !self.vj_audio_reactive
+                            {
+                                self.preview_started.elapsed().as_secs_f32()
+                            } else if self.audio_duration_seconds > 0.0 {
+                                audio_position_seconds
+                            } else {
+                                self.preview_started.elapsed().as_secs_f32()
+                            };
                             visuals::render(
                                 &ui.painter_at(frame_rect),
                                 frame_rect,
                                 &self.spectrum,
-                                if self.audio_duration_seconds > 0.0 {
-                                    audio_position_seconds
-                                } else {
-                                    self.preview_started.elapsed().as_secs_f32()
-                                },
+                                visual_time,
                                 self.audio_duration_seconds as f32,
                                 self.scene,
                                 if self.reactive_rendering {
@@ -919,11 +1103,15 @@ impl eframe::App for ShowViewer {
                                 },
                                 &mut self.audio_smoother,
                                 ui.input(|input| input.stable_dt),
+                                self.vj_seed,
+                                self.vj_audio_reactive,
                                 self.primary_color,
                                 self.secondary_color,
                                 Arc::clone(&self.export_controller),
                             );
-                            if self.selected_file.is_none() {
+                            if self.selected_file.is_none()
+                                && !(self.scene.is_vj_mode() && !self.vj_audio_reactive)
+                            {
                                 ui.painter().text(
                                     frame_rect.center(),
                                     egui::Align2::CENTER_CENTER,
@@ -944,7 +1132,9 @@ impl eframe::App for ShowViewer {
                                     egui::FontId::proportional(18.0),
                                     egui::Color32::from_rgb(175, 187, 201),
                                 );
-                            } else if self.spectrum.is_empty() {
+                            } else if self.spectrum.is_empty()
+                                && !(self.scene.is_vj_mode() && !self.vj_audio_reactive)
+                            {
                                 ui.painter().text(
                                     frame_rect.center(),
                                     egui::Align2::CENTER_CENTER,
@@ -1012,6 +1202,13 @@ impl eframe::App for ShowViewer {
                                     format_time(self.audio_duration_seconds)
                                 ));
                             });
+                            ui.label(
+                                egui::RichText::new(
+                                    "Play starts the selected visual with synchronized audio.",
+                                )
+                                .small()
+                                .color(egui::Color32::from_rgb(139, 153, 173)),
+                            );
                         });
                 },
             );
