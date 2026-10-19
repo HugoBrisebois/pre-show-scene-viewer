@@ -1,7 +1,7 @@
 [package]
 name = "showViewer"
 description = "Audio-reactive visuals with synchronized playback and full-track video export"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/HugoBrisebois/pre-show-scene-viewer"
